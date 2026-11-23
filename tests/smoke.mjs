@@ -494,12 +494,14 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // 19. GPU temperature, per-process VRAM consumers, and rising-memory trend.
 {
-  const memByCall = ['8500, 10240\n', '9000, 10240\n', '9600, 10240\n']
+  const memByCall = ['8500, 10240\n', '8500, 10240\n', '8500, 10240\n', '9000, 10240\n', '9000, 10240\n', '9000, 10240\n', '9600, 10240\n', '9600, 10240\n', '9600, 10240\n']
   let memCalls = 0
   const driverText = '572.70, NVIDIA GeForce RTX 4090, 94, P0\n'
   const appsText = '111, 4000, python\n222, 100, dsh\n'
   const { ctx, calls } = makeMockCtx({ resolveNvidia: () => Promise.resolve('C:/nvidia-smi.exe') })
-  apply(ctx, {})
+  // The default trend span (60 s) is deliberately strict for real sessions;
+  // the unit test compresses the span so 3 consecutive rising samples warn.
+  apply(ctx, { gpu: { trend: { minSpanMs: 0, minSlopePerMin: 2 } } })
   ctx.subprocess.spawn = (spec) => {
     calls.spawned.push(spec)
     let text
@@ -849,6 +851,362 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   const rendered = calls.tool.output.render({}, result)[0].text
   assert(rendered.includes('GPU deploy readiness: STOP'), 'render shows the stop verdict')
   console.log('PASS 30: deploy preflight go/caution/stop')
+}
+
+// 31. GPU multi-sample: judgment uses the WORST sample, report keeps all.
+{
+  const memQueue = ['8500, 10240\n', '9600, 10240\n', '8200, 10240\n']
+  const { ctx, calls } = makeMockCtx({ resolveNvidia: () => Promise.resolve('C:/nvidia-smi.exe') })
+  apply(ctx, { gpu: { samples: 3, sampleIntervalMs: 0 } })
+  ctx.subprocess.spawn = (spec) => {
+    calls.spawned.push(spec)
+    let text
+    if (spec.argv[1] === '--query-gpu=memory.used,memory.total') text = memQueue.length ? memQueue.shift() : '0, 10240\n'
+    else if (spec.argv[1] === '--query-gpu=driver_version,name,temperature.gpu,pstate') text = '572.70, RTX, 40, P0\n'
+    else if (spec.argv[1] === '--query-gpu=utilization.gpu,fan.speed,power.draw,power.limit') text = '50, 30, 150, 250\n'
+    else text = '111, 3000, python\n'
+    return {
+      collected: { stdout: { readFrom: () => ({ text }) }, stderr: { readFrom: () => ({ text: '' }) } },
+      done: Promise.resolve({ exitCode: 0 }),
+      terminate() {},
+    }
+  }
+  const result = await calls.tool.execute({ gpu: true, stuck: false, plugins: false, versions: false, coreChain: false, system: false, errors: false, self: false, ports: false, power: false })
+  assert.strictEqual(result.checks.gpu.samples.length, 3, '3 samples collected')
+  const memoryHigh = result.issues.find((i) => i.title.includes('GPU 0 memory high'))
+  assert(memoryHigh && memoryHigh.severity === 'warn', 'worst sample (94%) drives the verdict, not the last (80%)')
+  assert.strictEqual(result.checks.gpu.deploy.verdict, 'stop', 'worst sample also drives the deploy verdict')
+  assert(result.checks.gpu.driverInfo.extras && result.checks.gpu.driverInfo.extras.utilPct === 50, 'extras (util/fan/power) recorded')
+  console.log('PASS 31: GPU multi-sample uses worst sample')
+}
+
+// 32. GPU extras + fan-not-spinning warning at high temperature.
+{
+  const { ctx, calls } = makeMockCtx({ resolveNvidia: () => Promise.resolve('C:/nvidia-smi.exe') })
+  apply(ctx, { gpu: { samples: 1, sampleIntervalMs: 0 } })
+  ctx.subprocess.spawn = (spec) => {
+    let text
+    if (spec.argv[1] === '--query-gpu=memory.used,memory.total') text = '4000, 10240\n'
+    else if (spec.argv[1] === '--query-gpu=driver_version,name,temperature.gpu,pstate') text = '572.70, GPU, 90, P0\n'
+    else if (spec.argv[1] === '--query-gpu=utilization.gpu,fan.speed,power.draw,power.limit') text = '95, 0, 220, 250\n'
+    else text = '111, 3000, python\n'
+    return {
+      collected: { stdout: { readFrom: () => ({ text }) }, stderr: { readFrom: () => ({ text: '' }) } },
+      done: Promise.resolve({ exitCode: 0 }),
+      terminate() {},
+    }
+  }
+  const result = await calls.tool.execute({ gpu: true, stuck: false, plugins: false, versions: false, coreChain: false, system: false, errors: false, self: false, ports: false, power: false })
+  const tempWarn = result.issues.find((i) => i.title.includes('temperature'))
+  assert(tempWarn && tempWarn.severity === 'warn', '90C raises temperature warning')
+  const fanWarn = result.issues.find((i) => i.title.includes('fan not spinning'))
+  assert(fanWarn && fanWarn.severity === 'warn', 'fan 0 + hot GPU raises fan warning')
+  assert.strictEqual(result.checks.gpu.driverInfo.extras.utilPct, 95, 'extras util recorded')
+  console.log('PASS 32: GPU extras + fan-not-spinning warning')
+}
+
+// 33. System double-sample: mean warns, all-over errors, pagefile, pressure gate.
+{
+  const snap = (ramUsedPct, pagefileUsedPct = 50, wsMb = 12000) => {
+    const ramTotal = 32768
+    const pfTotal = 49152
+    return JSON.stringify({
+      cpu: 30,
+      ram: { totalMb: ramTotal, freeMb: Math.round((ramTotal * (100 - ramUsedPct)) / 100) },
+      pagefile: { totalMb: pfTotal, freeMb: Math.round((pfTotal * (100 - pagefileUsedPct)) / 100) },
+      disks: [{ name: 'C:', freeGb: 200, totalGb: 500 }],
+      processes: [{ name: 'python', pid: 123, wsMb }],
+    })
+  }
+  const runSys = async (snaps) => {
+    const queue = [...snaps]
+    const { ctx, calls } = makeMockCtx({ resolveNvidia: (cmd) => (cmd === 'powershell' ? Promise.resolve('C:/powershell.exe') : Promise.reject(new Error('nf'))) })
+    apply(ctx, { system: { samples: 2, sampleIntervalMs: 0 } })
+    ctx.subprocess.spawn = (spec) => {
+      calls.spawned.push(spec)
+      const text = spec.argv?.[1] === '-NoProfile' ? (queue.length ? queue.shift() : snap(50)) : ''
+      return {
+        collected: { stdout: { readFrom: () => ({ text }) }, stderr: { readFrom: () => ({ text: '' }) } },
+        done: Promise.resolve({ exitCode: 0 }),
+        terminate() {},
+      }
+    }
+    return calls.tool.execute({ gpu: false, stuck: false, plugins: false, versions: false, coreChain: false, system: true, errors: false, self: false, ports: false, power: false })
+  }
+  // (a) mean 92.5% → warn only (not all-over); heavy process under pressure → error
+  let r = await runSys([snap(88), snap(97)])
+  let issue = r.issues.find((i) => i.title.includes('System RAM high'))
+  assert(issue && issue.severity === 'warn', 'mean RAM pressure is a warning, not an error')
+  issue = r.issues.find((i) => i.title === 'Heavyweight process: python')
+  assert(issue && issue.severity === 'error', 'heavyweight process is an error under RAM pressure')
+  // (b) both samples beyond critical → error; pagefile too
+  r = await runSys([snap(97, 96), snap(97, 96)])
+  issue = r.issues.find((i) => i.title.includes('System RAM high'))
+  assert(issue && issue.severity === 'error', 'both samples critical → error')
+  issue = r.issues.find((i) => i.title.includes('Pagefile/commit high'))
+  assert(issue && issue.severity === 'error', 'pagefile double-sample critical → error')
+  // (c) no RAM pressure → heavyweight stays a warning
+  r = await runSys([snap(50), snap(50)])
+  issue = r.issues.find((i) => i.title.includes('Heavyweight process (no RAM pressure)'))
+  assert(issue && issue.severity === 'warn', 'heavyweight without RAM pressure stays a warning')
+  assert(!r.issues.find((i) => i.title.includes('System RAM high')), 'no RAM issue at 50%')
+  console.log('PASS 33: system double-sample mean/all-over + pagefile + pressure downgrade')
+}
+
+// 34. New error fingerprints + notify cooldown + failure-loop reset on success.
+{
+  const injected = []
+  const { ctx, calls, handlers } = makeMockCtx({ agents: [{ id: 'a1', inject: (msg) => injected.push(msg) }] })
+  apply(ctx, { errors: { notifyOnCritical: true, notifyCooldownMs: 60000, loopThreshold: 3 } })
+  const onResult = handlers['tools/result'][0]
+  const failing = (stderr) => onResult({ name: 'ops_bash' }, { exitCode: 1, stderr })
+  failing('connection timed out')
+  assert.strictEqual(injected.length, 1, 'timeout fingerprint notifies immediately')
+  failing('connection timed out again')
+  assert.strictEqual(injected.length, 1, 'same fingerprint respects cooldown')
+  onResult({ name: 'ops_bash' }, { exitCode: 0, stdout: 'ok' })
+  await sleep(5)
+  for (let k = 0; k < 3; k += 1) failing('ENOENT: no such file or directory')
+  assert.strictEqual(injected.length, 2, 'new fingerprint notifies once, then cooldown')
+  const errorsOnly = { gpu: false, stuck: false, plugins: false, versions: false, coreChain: false, system: false, errors: true, self: false, ports: false, power: false }
+  let result = await calls.tool.execute(errorsOnly)
+  let loop = result.issues.find((i) => i.title.includes('Failure loop') && i.title.includes('ops_bash'))
+  assert(loop && loop.severity === 'error', '3 identical failures since last success → failure loop')
+  onResult({ name: 'ops_bash' }, { exitCode: 0, stdout: 'ok' })
+  result = await calls.tool.execute(errorsOnly)
+  loop = result.issues.find((i) => i.title.includes('Failure loop'))
+  assert(!loop, 'success clears the loop window')
+  console.log('PASS 34: new fingerprints + notify cooldown + loop reset on success')
+}
+
+// 35. Port watch: EADDRINUSE-before-it-happens via netstat + tasklist.
+{
+  const { ctx, calls } = makeMockCtx({ resolveNvidia: (cmd) => (cmd === 'netstat' || cmd === 'tasklist' ? Promise.resolve('C:/' + cmd + '.exe') : Promise.reject(new Error('nf'))) })
+  apply(ctx, { ports: { enabled: true, watchPorts: [8080] } })
+  ctx.subprocess.spawn = (spec) => {
+    let text
+    if (spec.argv[1] === '-ano') text = '  TCP    0.0.0.0:8080           0.0.0.0:0              LISTENING       1234\n'
+    else if (spec.argv[1] === '/FO') text = '"node.exe","1234","Console","1","100,000 K"\n'
+    else text = ''
+    return {
+      collected: { stdout: { readFrom: () => ({ text }) }, stderr: { readFrom: () => ({ text: '' }) } },
+      done: Promise.resolve({ exitCode: 0 }),
+      terminate() {},
+    }
+  }
+  const result = await calls.tool.execute({ gpu: false, stuck: false, plugins: false, versions: false, coreChain: false, system: false, errors: false, self: false, ports: true, power: false })
+  const issue = result.issues.find((i) => i.title.includes('Port 8080 is already in use'))
+  assert(issue && issue.severity === 'warn', 'watched port in use raises warning')
+  assert.strictEqual(result.checks.ports.listening[0].name, 'node.exe', 'port owner resolved via tasklist')
+  console.log('PASS 35: port watch catches EADDRINUSE-before-it-happens')
+}
+
+// 36. Power plan: short standby + running job → warn; no job → silent.
+{
+  const runPower = async (jobs) => {
+    const { ctx, calls } = makeMockCtx({ jobs, resolveNvidia: (cmd) => (cmd === 'powercfg' ? Promise.resolve('C:/powercfg.exe') : Promise.reject(new Error('nf'))) })
+    apply(ctx, {})
+    ctx.subprocess.spawn = (spec) => {
+      let text
+      if (spec.argv[1] === '/getactivescheme') text = 'Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)\n'
+      else if (spec.argv[1] === '/query') text = 'Current AC Power Setting Index: 0x00000384\n'
+      else text = ''
+      return {
+        collected: { stdout: { readFrom: () => ({ text }) }, stderr: { readFrom: () => ({ text: '' }) } },
+        done: Promise.resolve({ exitCode: 0 }),
+        terminate() {},
+      }
+    }
+    return calls.tool.execute({ gpu: false, stuck: false, plugins: false, versions: false, coreChain: false, system: false, errors: false, self: false, ports: false, power: true })
+  }
+  const running = [{ id: 'j1', label: 'build', status: 'running', startedAt: new Date().toISOString() }]
+  let r = await runPower(running)
+  let issue = r.issues.find((i) => i.title.includes('System sleep can kill long-running jobs'))
+  assert(issue && issue.severity === 'warn', 'short standby + running job → warning')
+  assert.strictEqual(r.checks.power.standbySec, 900, 'standby parsed from hex (0x384 = 900s)')
+  r = await runPower([])
+  issue = r.issues.find((i) => i.title.includes('System sleep'))
+  assert(!issue, 'no running job → no warning')
+  console.log('PASS 36: power-plan sleep check only warns with running jobs')
+}
+
+// 37. stuckJobs expectedLongLabels allowlist.
+{
+  const jobs = [
+    { id: 'j1', label: 'npm build', status: 'running', startedAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString() },
+    { id: 'j2', label: 'ffmpeg encode', status: 'running', startedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() },
+  ]
+  const { ctx, calls } = makeMockCtx({ jobs })
+  apply(ctx, { stuckJobs: { expectedLongLabels: ['build'] } })
+  const result = await calls.tool.execute({ gpu: false, stuck: true, plugins: false, versions: false, coreChain: false, system: false, errors: false, self: false, ports: false, power: false })
+  assert(!result.issues.find((i) => i.title.includes('npm build')), 'expected-long job is not flagged')
+  assert(result.issues.find((i) => i.title.includes('ffmpeg encode')), 'other long job still flagged')
+  assert(result.checks.stuckJobs.expected.includes('npm build'), 'expected list recorded')
+  console.log('PASS 37: stuckJobs expectedLongLabels allowlist')
+}
+
+// 38. Plugin pending grace: quiet inside grace, warns after.
+{
+  const runPending = async (pendingGraceMs) => {
+    const plugins = [{ entryId: 'p1', moduleName: 'p', enabled: true, fiberPhase: 'pending' }]
+    const { ctx, calls } = makeMockCtx({ plugins })
+    apply(ctx, { plugins: { pendingGraceMs } })
+    return calls.tool.execute({ gpu: false, stuck: false, plugins: true, versions: false, coreChain: false, system: false, errors: false, self: false, ports: false, power: false })
+  }
+  let r = await runPending(60000)
+  assert(!r.issues.find((i) => i.title.includes('still activating')), 'pending within grace → no warning')
+  r = await runPending(0)
+  assert(r.issues.find((i) => i.title.includes('still activating')), 'pending beyond grace → warning')
+  console.log('PASS 38: plugin pending grace period')
+}
+
+// 39. Idle heartbeat outside the deploy window: error-only alerts.
+{
+  const injected = []
+  const { ctx, calls } = makeMockCtx({
+    agents: [{ id: 'a1', inject: (msg) => injected.push(msg) }],
+    resolveNvidia: (cmd) => (cmd === 'nvidia-smi' ? Promise.resolve('C:/nvidia-smi.exe') : Promise.reject(new Error('nf'))),
+  })
+  apply(ctx, { monitor: { enabled: true, intervalMs: 50, idleHeartbeatMs: 1000, alertCooldownMs: 0 }, gpu: { samples: 1, sampleIntervalMs: 0 } })
+  ctx.subprocess.spawn = (spec) => {
+    const text = spec.argv[1] === '--query-gpu=memory.used,memory.total' ? '9900, 10240\n' : ''
+    return {
+      collected: { stdout: { readFrom: () => ({ text }) }, stderr: { readFrom: () => ({ text: '' }) } },
+      done: Promise.resolve({ exitCode: 0 }),
+      terminate() {},
+    }
+  }
+  await calls.monitorTick()
+  assert.strictEqual(injected.length, 0, 'idle heartbeat not due yet → no alert')
+  await sleep(1100)
+  await calls.monitorTick()
+  assert.strictEqual(injected.length, 1, 'idle heartbeat fires after due')
+  assert(injected[0].content[0].text.includes('GPU alert') && injected[0].content[0].text.includes('memory critical'), 'alert carries the GPU critical error')
+  console.log('PASS 39: idle heartbeat outside deploy window (error-only)')
+}
+
+// 40. Deploy readiness merges GPU free% and RAM free% (worst wins).
+{
+  const snap = (ramUsedPct) => {
+    const total = 32768
+    return JSON.stringify({
+      cpu: 30,
+      ram: { totalMb: total, freeMb: Math.round((total * (100 - ramUsedPct)) / 100) },
+      pagefile: { totalMb: 49152, freeMb: 24576 },
+      disks: [{ name: 'C:', freeGb: 200, totalGb: 500 }],
+      processes: [],
+    })
+  }
+  const runMerge = async (ramUsedPct) => {
+    const { ctx, calls } = makeMockCtx({ resolveNvidia: (cmd) => (cmd === 'nvidia-smi' || cmd === 'powershell' ? Promise.resolve('C:/' + cmd + '.exe') : Promise.reject(new Error('nf'))) })
+    apply(ctx, { system: { samples: 1, sampleIntervalMs: 0 }, gpu: { samples: 1, sampleIntervalMs: 0 } })
+    ctx.subprocess.spawn = (spec) => {
+      let text
+      if (spec.argv[1] === '--query-gpu=memory.used,memory.total') text = '4900, 8151\n'
+      else if (spec.argv[1] === '--query-gpu=driver_version,name,temperature.gpu,pstate') text = '\n'
+      else if (spec.argv[1] === '--query-gpu=utilization.gpu,fan.speed,power.draw,power.limit') text = '30, 30, 100, 250\n'
+      else if (spec.argv[1] === '-NoProfile') text = snap(ramUsedPct)
+      else text = '111, 3000, python\n'
+      return {
+        collected: { stdout: { readFrom: () => ({ text }) }, stderr: { readFrom: () => ({ text: '' }) } },
+        done: Promise.resolve({ exitCode: 0 }),
+        terminate() {},
+      }
+    }
+    return calls.tool.execute({ gpu: true, stuck: false, plugins: false, versions: false, coreChain: false, system: true, errors: false, self: false, ports: false, power: false })
+  }
+  let r = await runMerge(90)
+  assert.strictEqual(r.checks.gpu.deploy.verdict, 'caution', 'RAM 90% used drags combined verdict to caution')
+  assert.strictEqual(r.checks.gpu.deploy.ramFreePct, 10, 'ramFreePct exposed')
+  assert.strictEqual(r.checks.gpu.deploy.combinedFreePct, 10, 'combined = min(GPU 40%, RAM 10%)')
+  r = await runMerge(95)
+  assert.strictEqual(r.checks.gpu.deploy.verdict, 'stop', 'RAM 95% used → stop')
+  console.log('PASS 40: deploy readiness merges GPU + RAM free space')
+}
+
+// 41. Trial expect assertions (exitCode / outputMatches / outputNotMatches) + verdict + durations.
+{
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-trial41-'))
+  const exportsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-export41-'))
+  const { ctx, calls } = makeMockCtx()
+  apply(ctx, { trial: { sandboxRoot: sandbox, exportsRoot: exportsDir } })
+  const tool = calls.tools.find((t) => t.name === 'safe_trial_run')
+  // wrong exit code
+  let create = await tool.execute({ action: 'create', spec: { name: 't41', runCmd: 'node app.js', runs: 2, expect: { exitCode: 0, outputMatches: 'ok' } } })
+  calls.spawnResults = [{ exitCode: 0, stdout: 'ok' }, { exitCode: 1, stdout: 'boom' }]
+  const ran = await tool.execute({ action: 'run', trialId: create.trialId })
+  assert.strictEqual(ran.passCount, 1, 'one run passed')
+  const analyzed = await tool.execute({ action: 'analyze', trialId: create.trialId })
+  assert(analyzed.issues.find((i) => i.title.includes('Unexpected exit code')), 'wrong exit code flagged')
+  assert.strictEqual(analyzed.verdict, 'failed', 'verdict failed')
+  assert(Number.isFinite(analyzed.durationsMs.total), 'durations reported')
+  // forbidden output
+  create = await tool.execute({ action: 'create', spec: { name: 't41b', runCmd: 'node app.js', runs: 1, expect: { exitCode: 0, outputMatches: 'hello', outputNotMatches: 'forbidden' } } })
+  calls.spawnResults = [{ exitCode: 0, stdout: 'hello forbidden' }]
+  await tool.execute({ action: 'run', trialId: create.trialId })
+  const b = await tool.execute({ action: 'analyze', trialId: create.trialId })
+  assert(b.issues.find((i) => i.title.includes('Forbidden output present')), 'forbidden output flagged')
+  // missing expected output
+  create = await tool.execute({ action: 'create', spec: { name: 't41c', runCmd: 'node app.js', runs: 1, expect: { exitCode: 0, outputMatches: 'hello' } } })
+  calls.spawnResults = [{ exitCode: 0, stdout: 'bye' }]
+  await tool.execute({ action: 'run', trialId: create.trialId })
+  const c = await tool.execute({ action: 'analyze', trialId: create.trialId })
+  assert(c.issues.find((i) => i.title.includes('Expected output missing')), 'missing output flagged')
+  fs.rmSync(sandbox, { recursive: true, force: true })
+  fs.rmSync(exportsDir, { recursive: true, force: true })
+  console.log('PASS 41: trial expect assertions + verdict + durations')
+}
+
+// 42. Trial watchGpu leak detection + export manifest + cleanup all.
+{
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-trial42-'))
+  const exportsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-export42-'))
+  const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-src42-'))
+  fs.writeFileSync(path.join(srcDir, 'run.js'), 'console.log(1)\n')
+  const { ctx, calls } = makeMockCtx({ resolveNvidia: (cmd) => (cmd === 'nvidia-smi' ? Promise.resolve('C:/nvidia-smi.exe') : Promise.reject(new Error('nf'))) })
+  apply(ctx, { trial: { sandboxRoot: sandbox, exportsRoot: exportsDir } })
+  const tool = calls.tools.find((t) => t.name === 'safe_trial_run')
+  const create = await tool.execute({ action: 'create', spec: { name: 't42', sourceDir: srcDir, runCmd: 'node run.js', runs: 2, watchGpu: true } })
+  const gpuQueue = ['2000\n', '2100\n', '2500\n']
+  const runQueue = [{ exitCode: 0, stdout: 'ok' }, { exitCode: 0, stdout: 'ok' }]
+  ctx.subprocess.spawn = (spec) => {
+    let text = ''
+    let exitCode = 0
+    if (spec.argv[1] === '--query-gpu=memory.used') text = gpuQueue.length ? gpuQueue.shift() : '2000\n'
+    else {
+      const q = runQueue.shift()
+      text = q.stdout
+      exitCode = q.exitCode
+    }
+    return {
+      collected: { stdout: { readFrom: () => ({ text }) }, stderr: { readFrom: () => ({ text: '' }) } },
+      done: Promise.resolve({ exitCode }),
+      terminate() {},
+    }
+  }
+  const ran = await tool.execute({ action: 'run', trialId: create.trialId })
+  assert.strictEqual(ran.gpu.beforeMiB, 2000, 'before sample')
+  assert.strictEqual(ran.gpu.afterMiB, 2500, 'after sample')
+  assert.strictEqual(ran.gpu.peakMiB, 2500, 'peak sample')
+  assert.strictEqual(ran.gpuLeakMiB, 500, 'leak detected between runs')
+  assert(ran.gpuLeakWarning, 'leak warning text present')
+  const analyzed = await tool.execute({ action: 'analyze', trialId: create.trialId })
+  assert(analyzed.issues.find((i) => i.title.includes('GPU memory leak suspected')), 'leak warning survives analysis')
+  assert.strictEqual(analyzed.verdict, 'clean', 'clean runs → clean verdict (leak stays a warning)')
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'csg-out42-'))
+  await tool.execute({ action: 'export', trialId: create.trialId, outputDir: outDir })
+  const manifest = JSON.parse(fs.readFileSync(path.join(outDir, 'trial-report.json'), 'utf8'))
+  assert.strictEqual(manifest.verdict, 'flaky', 'warn issue → flaky manifest verdict')
+  assert.strictEqual(manifest.fileCount, 1, 'one source file exported')
+  assert(manifest.issues.find((i) => i.title.includes('GPU memory leak suspected')), 'manifest carries the issues')
+  const cleaned = await tool.execute({ action: 'cleanup', trialId: 'all' })
+  assert.strictEqual(cleaned.removed.length, 1, 'all trials removed')
+  assert(!fs.existsSync(create.dir), 'sandbox dir removed')
+  fs.rmSync(sandbox, { recursive: true, force: true })
+  fs.rmSync(exportsDir, { recursive: true, force: true })
+  fs.rmSync(srcDir, { recursive: true, force: true })
+  fs.rmSync(outDir, { recursive: true, force: true })
+  console.log('PASS 42: trial watchGpu leak + export manifest + cleanup all')
 }
 
 console.log('ALL SMOKE TESTS PASSED')

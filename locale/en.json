@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Capability safety guard",
-    "description": "Automatic safety check after every capability change: 12 checks — GPU memory / resident model processes / deploy readiness (GO/CAUTION/STOP), stuck jobs, plugin health, @deepseek-ai version channels, core plugin chain, system resources, error fingerprints, failure loops; fixes what it safely can and explains the rest; deployment watch (2 s VRAM sampling, 30 s deep scans, report-only); plus safe_trial_run, a trial sandbox that runs new installs/programs in isolation, applies only your approved fixes, and exports the verified product.",
+    "description": "Automatic safety check after every capability change: 14 checks — GPU memory (multi-sample) / resident model processes / deploy readiness (GO/CAUTION/STOP, GPU+RAM combined), stuck jobs, plugin health, @deepseek-ai version channels, core plugin chain, system resources (double-sample + pagefile), error fingerprints (10 categories), failure loops, port watch, power plan; fixes what it safely can and explains the rest; deployment watch (2 s VRAM sampling, 20 s deep scans, 5 min idle heartbeat — report-only); plus safe_trial_run, a trial sandbox that runs new installs/programs in isolation (default 5 runs, exit-code/output assertions, VRAM-leak watch), applies only your approved fixes, and exports the verified product with an acceptance manifest.",
     "detail": "docs/DETAIL.md"
   }
 }

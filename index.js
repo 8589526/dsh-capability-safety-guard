@@ -35,10 +35,37 @@ export const name = 'capability-safety-guard'
 export const inject = ['tools', 'systemPrompt', 'pluginManager', 'jobs', 'agents', 'subprocess', 'timer']
 
 const DEFAULT_CONFIG = {
-  gpu: { enabled: true, warnUsedPct: 85, criticalUsedPct:95, autoKill: false, tempWarnC: 85, tempCriticalC: 92, resident: { enabled: true, warnAtPct: 80, patterns: ['ollama', 'llama'], autoStopOnFix: false } },
-  stuckJobs: { enabled: true, warnMs: 5 * 60 * 1000, killMs: 15 * 60 * 1000, autoKill: false },
-  plugins: { enabled: true, autoDisableFailed: true },
-  monitor: { enabled: true, intervalMs: 2 * 1000, deployWindowMs: 10 * 60 * 1000, heavyEveryNTicks: 15 },
+  gpu: {
+    enabled: true,
+    warnUsedPct: 85,
+    criticalUsedPct: 95,
+    autoKill: false,
+    tempWarnC: 85,
+    tempCriticalC: 92,
+    resident: { enabled: true, warnAtPct: 80, patterns: ['ollama', 'llama'], autoStopOnFix: false },
+    // Multi-sample each full GPU check (the monitor's per-tick snapshot
+    // stays single-sample). Judgment uses the WORST sample, the report
+    // shows every sample; short spikes no longer decide severity alone.
+    samples: 3,
+    sampleIntervalMs: 700,
+    // Rising-memory trend: linear regression over aggregated check points;
+    // only fires when the span and slope are both significant.
+    trend: { minSpanMs: 60 * 1000, minSlopePerMin: 2 },
+  },
+  stuckJobs: { enabled: true, warnMs: 5 * 60 * 1000, killMs: 15 * 60 * 1000, autoKill: false, expectedLongLabels: [] },
+  plugins: { enabled: true, autoDisableFailed: true, pendingGraceMs: 60 * 1000 },
+  monitor: {
+    enabled: true,
+    intervalMs: 2 * 1000,
+    deployWindowMs: 10 * 60 * 1000,
+    heavyEveryNTicks: 10,
+    // Outside the deploy window the monitor still patrols on a slow
+    // heartbeat (GPU + stuck jobs + system), alerting only on errors.
+    idleHeartbeatMs: 5 * 60 * 1000,
+    // Per-alert cooldown: the same finding is not re-injected until this
+    // much time has passed (stops alert spam on persistent problems).
+    alertCooldownMs: 10 * 60 * 1000,
+  },
   installGuard: { enabled: true, flagPrerelease: true, warnCoreChainDisabled: true, trackRestartPending: true },
   system: {
     enabled: true,
@@ -46,18 +73,27 @@ const DEFAULT_CONFIG = {
     cpu: { warnUsedPct: 85, criticalUsedPct: 95 },
     disk: { paths: ['C:', 'D:'], warnFreePct: 15, criticalFreePct: 8 },
     processes: { warnWorkingSetMb: 6144, criticalWorkingSetMb: 10240, allowedNames: [], autoKill: false },
+    pagefile: { warnUsedPct: 85, criticalUsedPct: 95 },
+    // Double-sample each system check: warnings use the average, errors
+    // need BOTH samples beyond critical (transient spikes stay warnings).
+    samples: 2,
+    sampleIntervalMs: 1500,
   },
-  errors: { enabled: true, notifyOnCritical: true, loopThreshold: 3 },
+  errors: { enabled: true, notifyOnCritical: true, loopThreshold: 3, windowMs: 20 * 60 * 1000, notifyCooldownMs: 10 * 60 * 1000 },
+  ports: { enabled: true, watchPorts: [] },
+  power: { enabled: true, minStandbyMin: 30, minHibernateMin: 30 },
   trial: {
     enabled: true,
     sandboxRoot: '', // default: <temp>/dsh-trial-sandbox
     exportsRoot: '', // default: <temp>/dsh-trial-output
-    defaultRuns: 3,
+    defaultRuns: 5,
+    maxRuns: 20,
     runTimeoutSec: 180,
     installTimeoutSec: 600,
+    gpuLeakWarnMiB: 200,
   },
   self: { enabled: true },
-  deploy: { enabled: true, goFreePct: 25, stopFreePct: 10 },
+  deploy: { enabled: true, goFreePct: 25, stopFreePct: 10, ramGoFreePct: 15, ramStopFreePct: 8 },
   silentCheckDebounceMs: 2000,
   maxRecentChanges: 20,
 }
@@ -81,13 +117,13 @@ const PROMPT_SECTION_ORDER = 550
 
 const PROMPT_TEXT = `Capability safety policy (enforced by the capability-safety-guard plugin):
 - Right after you add or upgrade any capability in this session — install, upgrade, or enable a plugin or bundle, register a new tool or skill, add or change an MCP server, or change the agent preset, model, or adapter — call the capability_safety_check tool once the change has landed.
-- The tool checks GPU memory pressure (including which processes hold VRAM, GPU temperature/throttling, and rising-memory trends), long-running background jobs, plugin activation health, installed @deepseek-ai package version channels, core plugin chain health, system resources (RAM, CPU, drives, heavyweight processes), recent tool-error fingerprints and repeated-failure loops, and the guardian's own health. It always applies the non-destructive fixes (for example disabling a plugin that failed to activate, when the config allows it). Pass fix: true to also apply destructive fixes the config allows (killing stuck jobs or GPU processes); never pass fix: true for GPU kills unless the user asked you to.
+- The tool checks GPU memory pressure (multi-sampled, including which processes hold VRAM, GPU temperature/throttling, utilization/fan/power extras and rising-memory trends), long-running background jobs, plugin activation health, installed @deepseek-ai package version channels, core plugin chain health, system resources (multi-sampled RAM/CPU/pagefile, drives, heavyweight processes), listening ports, Windows power settings, recent tool-error fingerprints (OOM, port, disk, permission, missing module, timeout, TLS, DNS, encoding, missing file) and repeated-failure loops, and the guardian's own health. It always applies the non-destructive fixes (for example disabling a plugin that failed to activate, when the config allows it). Pass fix: true to also apply destructive fixes the config allows (killing stuck jobs or GPU processes); never pass fix: true for GPU kills unless the user asked you to.
 - If the tool reports a problem it cannot fix, explain to the user why it cannot be fixed automatically and what they can do.
 - Install-guard lessons from a past outage: before relying on a freshly installed or upgraded bundle, verify the RESOLVED (actually installed) version and its release channel (stable/alpha/beta/rc) of every @deepseek-ai package in this profile, not just the version the catalog or directory label claimed — a version/channel mismatch can get core plugins auto-disabled at boot and take down the whole app. Keep quarantines and backups in place until the fix chain is fully verified; never undo a protection (e.g. renaming a quarantined copy back) before you have confirmed the removal path works. The tool surfaces prerelease/mixed-channel hazards and pending-restart changes.
 - Software/program development on this machine carries extra hazards, and the tool also checks them: system RAM pressure, free space on the workspace/profile drives, and heavyweight processes (system check); and it watches tool results for error fingerprints such as out-of-memory (CUDA OOM), port conflicts (EADDRINUSE), disk-full, permission-denied, and missing-module errors (errors check). When writing or running software here: (1) install pip/npm/pnpm packages into an isolated project environment (venv / project node_modules) and NEVER into the DSH profile or runtime directories — the deepest past outage was caused by a profile-wide dependency drag; (2) before binding a port, check it is free (a taken port fails the server with EADDRINUSE); (3) run long tasks as background jobs with timeouts and clean them up; (4) keep quarantines/backups until the fix is verified, and free disk space if a drive runs low; (5) on Windows, system sleep can kill long-running jobs — check power settings when a job must run for hours.
  - Try-before-commit workflow: before installing anything new (a downloaded app, a local model, a package set) or running newly written software for real, stage it in a sandbox trial first with the safe_trial_run tool: action "create" (isolated sandbox dir; python trials get their own venv; cleaned HOME/TEMP/PIP/NPM env), then action "run" to install and execute the program several times (each run has a timeout and captured output), then action "analyze" to collect crashes and error fingerprints and get proposed fixes. Report every problem and the proposed fixes to the USER, let the USER decide which fixes to apply, then action "fix" with ONLY the approved fixes (all fixes stay inside the sandbox), "run" + "analyze" again until clean, and finally action "export" to copy the verified product out of the sandbox and present it as the final artifact. The sandbox isolates files, environment and processes — it is NOT a VM: the GPU and OS are shared, so watch capability_safety_check for VRAM pressure during GPU trials. Trial state is plugin memory (lost on restart); clean up finished trials with action "cleanup".
- - Pre-deploy VRAM cleanup (ANY local model or program, not only Ollama): when you learn a deploy is coming (image generation, another big model, a local server, training), first call capability_safety_check and read the "GPU deploy readiness" verdict plus any "Resident model process(es)" issue. GO = proceed. CAUTION/STOP = free VRAM before starting, without asking: for ollama/llama resident processes run \`ollama stop\` right away (or capability_safety_check with fix: true and gpu.resident.autoStopOnFix to do it via the tool). For ANY OTHER holder process (ComfyUI, python jobs, other servers), never kill silently — list the processes and ask the user before stopping them. Re-check afterwards and only start once the verdict is GO, because on this 8 GB card the display itself needs that VRAM and can black-screen. Prefer OLLAMA_KEEP_ALIVE settings so idle models unload on their own.
- - Deploy preflight for ANY model or program: before you deploy or run any local model or program (image generation, Ollama/llama, training jobs, local servers), call capability_safety_check and read the "GPU deploy readiness" line (checks.gpu.deploy). verdict GO = enough headroom; CAUTION = only a small workload will fit; STOP = do not deploy — free VRAM first (ollama stop, close GPU apps) and re-check, because on this card the display itself needs that VRAM and can black-screen. The trial sandbox (safe_trial_run with watchGpu) is the recommended way to stage the first real runs.`
+ - Pre-deploy VRAM cleanup (ANY local model or program, not only Ollama): when you learn a deploy is coming (image generation, another big model, a local server, training), first call capability_safety_check and read the "Deploy readiness" verdict (combined GPU + RAM headroom) plus any "Resident model process(es)" issue. GO = proceed. CAUTION/STOP = free VRAM before starting, without asking: for ollama/llama resident processes run \`ollama stop\` right away (or capability_safety_check with fix: true and gpu.resident.autoStopOnFix to do it via the tool). For ANY OTHER holder process (ComfyUI, python jobs, other servers), never kill silently — list the processes and ask the user before stopping them. Re-check afterwards and only start once the verdict is GO, because on this 8 GB card the display itself needs that VRAM and can black-screen. Prefer OLLAMA_KEEP_ALIVE settings so idle models unload on their own.
+ - Deploy preflight for ANY model or program: before you deploy or run any local model or program (image generation, Ollama/llama, training jobs, local servers), call capability_safety_check and read the "Deploy readiness" line (checks.gpu.deploy, combined GPU+RAM headroom). verdict GO = enough headroom; CAUTION = only a small workload will fit; STOP = do not deploy — free VRAM first (ollama stop, close GPU apps) and re-check, because on this card the display itself needs that VRAM and can black-screen. The trial sandbox (safe_trial_run with watchGpu) is the recommended way to stage the first real runs.`
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -109,6 +145,24 @@ function mergeConfig(base, override) {
 function truncate(text, max = 300) {
   const s = String(text)
   return s.length > max ? s.slice(0, max) + '…' : s
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Convert a "/pattern/flags" string into a RegExp; returns null for
+ * anything that is not a regex literal (callers then treat it as plain
+ * text). Invalid regex literals also return null instead of throwing.
+ */
+function toRegExp(value) {
+  const s = String(value)
+  const m = s.match(/^\/(.+)\/([a-z]*)$/)
+  if (!m) return null
+  try {
+    return new RegExp(m[1], m[2])
+  } catch {
+    return null
+  }
 }
 
 function describeChangeResult(res) {
@@ -394,7 +448,7 @@ export function parseAppRows(text) {
   return rows
 }
 
-async function checkGpu(ctx, cfg, fix, withDriverInfo = false, state = null, withProcesses = false) {
+async function checkGpu(ctx, cfg, fix, withDriverInfo = false, state = null, withProcesses = false, sampling = 'multi') {
   const out = { checked: false, issues: [] }
   if (!cfg.gpu.enabled) {
     out.note = 'GPU check disabled in plugin config.'
@@ -408,44 +462,85 @@ async function checkGpu(ctx, cfg, fix, withDriverInfo = false, state = null, wit
     out.note = 'nvidia-smi not found: no NVIDIA GPU, driver, or tools on this machine; GPU check skipped.'
     return out
   }
-  let queryText
-  try {
-    queryText = await runCapture(ctx, [exe, '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'])
-  } catch (error) {
-    out.checked = true
-    out.error = `nvidia-smi query failed: ${truncate(String(error?.message ?? error))}`
-    if (state) state.stats.gpuSnapshotsFail += 1
-    return out
+  // Multi-sample the memory query on full checks (the monitor's per-tick
+  // snapshot stays single-sample). Judgment uses the WORST sample so a
+  // transient spike cannot be missed; the report shows every sample so a
+  // one-off spike is visible as such.
+  const sampleCount = sampling === 'single' ? 1 : Math.max(1, Math.min(10, Math.floor(Number(cfg.gpu.samples ?? 3)) || 3))
+  const sampleIntervalMs = Math.max(0, Number(cfg.gpu.sampleIntervalMs) || 0)
+  const samplesList = []
+  let queryError = null
+  for (let i = 0; i < sampleCount; i++) {
+    try {
+      const queryText = await runCapture(ctx, [exe, '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'])
+      const parsed = parseGpuRows(queryText)
+      if (parsed.length) samplesList.push(parsed)
+      else if (!queryError) queryError = new Error('nvidia-smi returned no usable rows')
+    } catch (error) {
+      if (!queryError) queryError = error
+    }
+    if (i < sampleCount - 1 && sampleIntervalMs > 0) await sleep(sampleIntervalMs)
   }
   out.checked = true
-  const rows = parseGpuRows(queryText)
-  if (!rows.length) {
-    out.note = 'nvidia-smi returned no usable rows.'
+  if (!samplesList.length) {
+    if (state) state.stats.gpuSnapshotsFail += 1
+    out.error = queryError ? `nvidia-smi query failed: ${truncate(String(queryError?.message ?? queryError))}` : 'nvidia-smi returned no usable rows.'
     return out
   }
+  const rows = samplesList[samplesList.length - 1]
+  // Worst sample per GPU index — severity and the deploy verdict use this.
+  const worst = rows.map((row, index) => {
+    let max = row
+    for (const sample of samplesList) {
+      const candidate = sample[index]
+      if (candidate && candidate.used > max.used) max = candidate
+    }
+    return max
+  })
   out.rows = rows
+  out.samples = samplesList.map((sample) =>
+    sample.map((row) => ({ used: row.used, total: row.total, pct: row.total > 0 ? Math.round((100 * row.used) / row.total) : 0 })),
+  )
   if (state) {
-    state.gpuSamples.push({ at: new Date().toISOString(), pct: Math.round((100 * rows[0].used) / rows[0].total) })
+    // One aggregated point per check (the worst sample), not per micro-sample.
+    const worstPct = Math.round((100 * worst[0].used) / worst[0].total)
+    state.gpuSamples.push({ at: new Date().toISOString(), pct: worstPct })
     if (state.gpuSamples.length > 60) state.gpuSamples.shift()
     state.stats.gpuSnapshotsOk += 1
   }
   if (withDriverInfo) {
-    try {
-      const infoText = await runCapture(ctx, [exe, '--query-gpu=driver_version,name,temperature.gpu,pstate', '--format=csv,noheader,nounits'])
-      const firstLine = String(infoText).split(/\r?\n/)[0] ?? ''
-      const parts = firstLine.split(',').map((p) => p.trim())
-      const driverVersion = parts[0] ?? ''
-      if (driverVersion) {
-        out.driverInfo = { version: driverVersion, gpuName: parts[1] ?? '', tempC: Number.parseInt(parts[2], 10), pstate: parts[3] ?? '' }
+    // Temperature is sampled twice; the higher value decides (a hot spike
+    // between samples must not be averaged away).
+    const temps = []
+    let baseParts = []
+    for (let i = 0; i < 2; i++) {
+      try {
+        const infoText = await runCapture(ctx, [exe, '--query-gpu=driver_version,name,temperature.gpu,pstate', '--format=csv,noheader,nounits'])
+        const parts = String(infoText).split(/\r?\n/)[0]?.split(',').map((p) => p.trim()) ?? []
+        if (parts.length >= 1 && parts[0]) {
+          baseParts = parts
+          const tempC = Number.parseInt(parts[2], 10)
+          if (Number.isFinite(tempC) && tempC > 0) temps.push(tempC)
+        }
+      } catch {
+        /* driver info is best-effort */
       }
-      const tempC = Number.parseInt(parts[2], 10)
+      if (i === 0) await sleep(350)
+    }
+    if (baseParts.length) {
+      const driverVersion = baseParts[0] ?? ''
+      const parsedTemp = Number.parseInt(baseParts[2], 10)
+      const tempC = temps.length ? Math.max(...temps) : parsedTemp
+      if (driverVersion) {
+        out.driverInfo = { version: driverVersion, gpuName: baseParts[1] ?? '', tempC: Number.isFinite(tempC) ? tempC : NaN, pstate: baseParts[3] ?? '' }
+      }
       if (Number.isFinite(tempC) && tempC > 0) {
         if (tempC >= cfg.gpu.tempCriticalC) {
           out.issues.push({
             severity: 'error',
             kind: 'gpu',
             title: 'GPU 0 temperature critical',
-            detail: `${tempC}°C (critical ${cfg.gpu.tempCriticalC}°C)${parts[3] ? `, perf state ${parts[3]}` : ''} — the card may be thermal-throttling, which slows work and destabilizes long jobs.`,
+            detail: `${tempC}°C (critical ${cfg.gpu.tempCriticalC}°C)${baseParts[3] ? `, perf state ${baseParts[3]}` : ''} — the card may be thermal-throttling, which slows work and destabilizes long jobs.`,
             fixed: false,
             unfixableReason:
               'not auto-fixed: temperature is a cooling/power problem. Reduce load or batch size, check fans and ambient temperature, cap power draw (nvidia-smi -pl), then re-run.',
@@ -455,13 +550,39 @@ async function checkGpu(ctx, cfg, fix, withDriverInfo = false, state = null, wit
             severity: 'warn',
             kind: 'gpu',
             title: 'GPU 0 temperature high',
-            detail: `${tempC}°C (warn ${cfg.gpu.tempWarnC}°C)${parts[3] ? `, perf state ${parts[3]}` : ''} — watch for throttling.`,
+            detail: `${tempC}°C (warn ${cfg.gpu.tempWarnC}°C)${baseParts[3] ? `, perf state ${baseParts[3]}` : ''} — watch for throttling.`,
             fixed: false,
           })
         }
       }
+    }
+    // Utilization / fan / power extras: strictly validated (all four fields
+    // finite, utilization within 0-100) so a misrouted query can never
+    // fabricate telemetry.
+    try {
+      const extrasText = await runCapture(ctx, [exe, '--query-gpu=utilization.gpu,fan.speed,power.draw,power.limit', '--format=csv,noheader,nounits'])
+      const parts = String(extrasText).split(/\r?\n/)[0]?.split(',').map((p) => p.trim()) ?? []
+      const util = Number.parseFloat(parts[0])
+      const fan = Number.parseFloat(parts[1])
+      const draw = Number.parseFloat(parts[2])
+      const limit = Number.parseFloat(parts[3])
+      if ([util, fan, draw, limit].every((v) => Number.isFinite(v)) && util >= 0 && util <= 100) {
+        if (!out.driverInfo) out.driverInfo = {}
+        out.driverInfo.extras = { utilPct: Math.round(util), fanPct: Math.round(fan), powerDrawW: Math.round(draw), powerLimitW: Math.round(limit) }
+        const tempNow = Number(out.driverInfo.tempC)
+        if (fan === 0 && Number.isFinite(tempNow) && tempNow >= cfg.gpu.tempWarnC) {
+          out.issues.push({
+            severity: 'warn',
+            kind: 'gpu',
+            title: 'GPU 0 fan not spinning while hot',
+            detail: `temperature ${tempNow}°C but fan speed is 0% — passive cooling cannot keep up under load.`,
+            fixed: false,
+            unfixableReason: 'not auto-fixed: fan control is hardware/power-management territory. Check the fan curve and cooling hardware, and reduce load meanwhile.',
+          })
+        }
+      }
     } catch {
-      /* driver info is best-effort */
+      /* extras are best-effort */
     }
   }
   if (withProcesses) {
@@ -483,7 +604,7 @@ async function checkGpu(ctx, cfg, fix, withDriverInfo = false, state = null, wit
   // small card the display shares the VRAM, so a full GPU can black-screen
   // the desktop the moment the next workload starts.
   if (cfg.deploy?.enabled !== false && withProcesses) {
-    const row = rows[0]
+    const row = worst[0]
     const freeMiB = Math.max(0, row.total - row.used)
     const freePct = Math.round((100 * freeMiB) / row.total)
     const holders = (out.consumers ?? []).map((c) => (c.name ? `${c.name} (${c.usedKnown ? `${c.used} MiB` : 'N/A MiB'})` : `pid ${c.pid} (${c.usedKnown ? `${c.used} MiB` : 'N/A MiB'})`))
@@ -525,7 +646,7 @@ async function checkGpu(ctx, cfg, fix, withDriverInfo = false, state = null, wit
     if (residentApps.length) {
       const knownMiB = residentApps.filter((c) => c.usedKnown).reduce((sum, c) => sum + c.used, 0)
       const anyKnown = residentApps.some((c) => c.usedKnown)
-      const pct = Math.round((100 * rows[0].used) / rows[0].total)
+      const pct = Math.round((100 * worst[0].used) / worst[0].total)
       const warnAt = residentCfg.warnAtPct ?? 80
       if (pct >= warnAt) {
         const issue = {
@@ -571,24 +692,42 @@ async function checkGpu(ctx, cfg, fix, withDriverInfo = false, state = null, wit
     }
   }
   // Rising-memory trend across the sampled window (leak / growing workload).
+  // Linear regression over aggregated check points: fires only when the span
+  // is long enough AND the slope is steep enough — single-sample wobble or a
+  // plateau no longer raises a false "rising" alarm.
   if (state && state.gpuSamples.length >= 3) {
-    const samples = state.gpuSamples
-    const first = samples[0]
-    const last = samples[samples.length - 1]
-    const spanMs = new Date(last.at).getTime() - new Date(first.at).getTime()
-    const delta = last.pct - first.pct
-    if (spanMs > 0 && delta >= 10 && last.pct >= cfg.gpu.warnUsedPct) {
+    const points = state.gpuSamples
+    const t0 = new Date(points[0].at).getTime()
+    const times = points.map((p) => new Date(p.at).getTime() - t0)
+    const pcts = points.map((p) => p.pct)
+    const spanMs = times[times.length - 1]
+    const n = times.length
+    const meanT = times.reduce((a, b) => a + b, 0) / n
+    const meanP = pcts.reduce((a, b) => a + b, 0) / n
+    let num = 0
+    let den = 0
+    for (let i = 0; i < n; i++) {
+      num += (times[i] - meanT) * (pcts[i] - meanP)
+      den += (times[i] - meanT) ** 2
+    }
+    const slopePerMin = den > 0 ? (num / den) * 60000 : 0
+    const trendCfg = cfg.gpu.trend ?? {}
+    const minSpanMs = Math.max(0, Number(trendCfg.minSpanMs ?? 60 * 1000))
+    const minSlopePerMin = Number(trendCfg.minSlopePerMin ?? 2)
+    const lastPct = pcts[n - 1]
+    const firstPct = pcts[0]
+    if (spanMs >= minSpanMs && slopePerMin >= minSlopePerMin && lastPct >= cfg.gpu.warnUsedPct && lastPct > firstPct) {
       out.issues.push({
         severity: 'warn',
         kind: 'gpu',
         title: 'GPU 0 memory rising steadily',
-        detail: `+${delta} percentage points over ${Math.max(1, Math.round(spanMs / 60000))} min (${first.pct}% → ${last.pct}%) — a memory leak or a growing workload`,
+        detail: `+${Math.round(slopePerMin * 10) / 10}%/min over ${Math.max(1, Math.round(spanMs / 60000))} min (${firstPct}% → ${lastPct}%) — a memory leak or a growing workload`,
         fixed: false,
       })
     }
   }
   const critical = []
-  rows.forEach((row, index) => {
+  worst.forEach((row, index) => {
     const pct = Math.round((100 * row.used) / row.total)
     if (pct >= cfg.gpu.criticalUsedPct) {
       const issue = {
@@ -622,7 +761,7 @@ async function checkGpu(ctx, cfg, fix, withDriverInfo = false, state = null, wit
       }
     } else {
       try {
-        const { killed, freed } = await killGpuConsumers(ctx, exe, cfg.gpu.warnUsedPct, rows)
+        const { killed, freed } = await killGpuConsumers(ctx, exe, cfg.gpu.warnUsedPct, worst)
         for (const { issue } of critical) {
           if (killed.length) {
             issue.fixed = true
@@ -682,8 +821,17 @@ async function checkStuckJobs(ctx, cfg, fix) {
   }
   out.checked = true
   const now = Date.now()
+  // Long-running jobs whose label matches an entry here are EXPECTED to
+  // run long (builds, training, downloads); they never produce warnings.
+  const expectedLabels = (cfg.stuckJobs.expectedLongLabels ?? []).map((l) => String(l).toLowerCase()).filter(Boolean)
+  const expectedJobs = []
   for (const job of views) {
     if (job.status !== 'running' && job.status !== 'stopping') continue
+    const label = String(job.label ?? '').toLowerCase()
+    if (expectedLabels.some((l) => label.includes(l))) {
+      expectedJobs.push(job.label ?? job.id)
+      continue
+    }
     const startedAt = new Date(job.startedAt).getTime()
     if (Number.isNaN(startedAt)) continue
     const ageMs = now - startedAt
@@ -721,6 +869,10 @@ async function checkStuckJobs(ctx, cfg, fix) {
         fixed: false,
       })
     }
+  }
+  if (expectedJobs.length) {
+    out.expected = expectedJobs
+    out.note = `Skipped ${expectedJobs.length} job(s) marked as expected-long by stuckJobs.expectedLongLabels: ${expectedJobs.join(', ')}.`
   }
   return out
 }
@@ -773,14 +925,25 @@ async function checkPlugins(ctx, cfg, state) {
       }
       out.issues.push(issue)
     } else if (plugin.fiberPhase === 'pending' && plugin.enabled) {
+      // Only warn when the plugin has been pending longer than the grace
+      // period — a plugin that is briefly "pending" right after an install
+      // is normal and previously caused false warnings.
+      const entryKey = plugin.entryId ?? plugin.moduleName ?? '?'
+      const firstSeen = state.pendingSince.get(entryKey) ?? Date.now()
+      if (!state.pendingSince.has(entryKey)) state.pendingSince.set(entryKey, firstSeen)
+      const graceMs = Math.max(0, Number(cfg.plugins.pendingGraceMs ?? 60 * 1000))
+      if (Date.now() - firstSeen < graceMs) continue
       out.issues.push({
         severity: 'warn',
         kind: 'plugin',
-        title: `Plugin "${plugin.entryId ?? plugin.moduleName}" is still activating`,
-        detail: 'fiberPhase pending; if it stays pending, a restart may be required.',
+        title: `Plugin "${entryKey}" is still activating`,
+        detail: `fiberPhase pending for ${Math.round((Date.now() - firstSeen) / 1000)}s; if it stays pending, a restart may be required.`,
         entryId: plugin.entryId,
         fixed: false,
       })
+    } else if (plugin.fiberPhase !== 'pending') {
+      // No longer pending: forget the pending timer.
+      state.pendingSince.delete(plugin.entryId ?? plugin.moduleName ?? '?')
     }
   }
   return out
@@ -954,9 +1117,12 @@ const SYSTEM_PS_SCRIPT =
   "$cpu=[math]::Round((Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average);" +
   "$os=Get-CimInstance Win32_OperatingSystem;" +
   "$ram=[PSCustomObject]@{totalMb=[math]::Round($os.TotalVisibleMemorySize/1024);freeMb=[math]::Round($os.FreePhysicalMemory/1024)};" +
+  "$pfTotal=[math]::Max(0,[math]::Round(($os.TotalVirtualMemorySize-$os.TotalVisibleMemorySize)/1024));" +
+  "$pfFree=[math]::Max(0,[math]::Round(($os.FreeVirtualMemory-$os.FreePhysicalMemory)/1024));" +
+  "$pagefile=[PSCustomObject]@{totalMb=$pfTotal;freeMb=$pfFree};" +
   "$disks=@(Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Used -ne $null} | ForEach-Object {[PSCustomObject]@{name=$_.Name;freeGb=[math]::Round($_.Free/1GB,2);totalGb=[math]::Round(($_.Used+$_.Free)/1GB,2)}});" +
-  "$procs=@(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 12) | ForEach-Object {[PSCustomObject]@{name=$_.ProcessName;pid=$_.Id;wsMb=[math]::Round($_.WorkingSet64/1MB)}};" +
-  "[PSCustomObject]@{cpu=$cpu;ram=$ram;disks=$disks;processes=$procs} | ConvertTo-Json -Depth 3 -Compress"
+  "$procs=@(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 15) | ForEach-Object {[PSCustomObject]@{name=$_.ProcessName;pid=$_.Id;wsMb=[math]::Round($_.WorkingSet64/1MB)}};" +
+  "[PSCustomObject]@{cpu=$cpu;ram=$ram;pagefile=$pagefile;disks=$disks;processes=$procs} | ConvertTo-Json -Depth 3 -Compress"
 
 async function powerShellSystemSnapshot(ctx) {
   let exe = null
@@ -991,55 +1157,114 @@ function normalizeDriveName(name) {
  * call per check. Report-only by default; processes may be force-killed
  * when the config allows it and the call passes fix: true.
  */
-async function checkSystem(ctx, cfg, fix) {
+async function checkSystem(ctx, cfg, fix, sampling = 'multi') {
   const out = { checked: false, issues: [] }
   if (!cfg.system?.enabled) {
     out.note = 'System check disabled in plugin config.'
     return out
   }
-  let snapshot
-  try {
-    const result = await powerShellSystemSnapshot(ctx)
-    if (result.error) {
-      out.checked = true
-      out.note = result.error
-      return out
+  // Double-sample: warnings use the average of both samples; errors need
+  // BOTH samples beyond the critical threshold, so a transient spike no
+  // longer raises a false critical alert.
+  const sampleCount = sampling === 'single' ? 1 : Math.max(1, Math.min(4, Math.floor(Number(cfg.system.samples ?? 2)) || 2))
+  const sampleIntervalMs = Math.max(0, Number(cfg.system.sampleIntervalMs) || 0)
+  const snapshots = []
+  let snapshotError = null
+  for (let i = 0; i < sampleCount; i++) {
+    try {
+      const result = await powerShellSystemSnapshot(ctx)
+      if (result.error) snapshotError = result.error
+      else snapshots.push(result.snapshot)
+    } catch (error) {
+      snapshotError = String(error?.message ?? error)
     }
-    snapshot = result.snapshot
-  } catch (error) {
-    out.checked = true
-    out.error = `PowerShell system snapshot failed: ${truncate(String(error?.message ?? error))}`
-    return out
+    if (i < sampleCount - 1 && sampleIntervalMs > 0) await sleep(sampleIntervalMs)
   }
   out.checked = true
+  if (!snapshots.length) {
+    out.note = snapshotError ?? 'PowerShell system snapshot failed.'
+    return out
+  }
+  const snapshot = snapshots[snapshots.length - 1]
   out.snapshot = snapshot
+  out.samples = snapshots
+  const mean = (field) => {
+    const values = snapshots.map((s) => Number(s?.[field])).filter((v) => Number.isFinite(v))
+    return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null
+  }
+  const allOver = (field, threshold) => {
+    const values = snapshots.map((s) => Number(s?.[field])).filter((v) => Number.isFinite(v))
+    return values.length === snapshots.length && values.every((v) => v >= threshold)
+  }
 
   // RAM pressure.
   const ram = snapshot?.ram
   if (ram && Number.isFinite(ram.totalMb) && Number.isFinite(ram.freeMb) && ram.totalMb > 0) {
-    const usedPct = Math.round((100 * (ram.totalMb - ram.freeMb)) / ram.totalMb)
-    const title = `System RAM high (${usedPct}%)`
-    const detail = `${usedPct}% used (${ram.freeMb} MB free of ${ram.totalMb} MB), threshold ${cfg.system.ram.warnUsedPct}%`
-    if (usedPct >= cfg.system.ram.criticalUsedPct) {
-      out.issues.push({
-        severity: 'error',
-        kind: 'system',
-        title,
-        detail: `${detail} (critical ${cfg.system.ram.criticalUsedPct}%)`,
-        fixed: false,
-        unfixableReason:
-          'not auto-fixed: RAM cannot be freed safely by this plugin. Close the heavyweight processes listed by this check (or wait for running jobs to finish), then re-run.',
+    const usedPcts = snapshots
+      .map((s) => {
+        const r = s?.ram
+        return r && Number.isFinite(r.totalMb) && Number.isFinite(r.freeMb) && r.totalMb > 0 ? (100 * (r.totalMb - r.freeMb)) / r.totalMb : null
       })
-    } else if (usedPct >= cfg.system.ram.warnUsedPct) {
-      out.issues.push({ severity: 'warn', kind: 'system', title, detail, fixed: false })
+      .filter((v) => v !== null)
+    if (usedPcts.length) {
+      const usedPct = Math.round(usedPcts.reduce((a, b) => a + b, 0) / usedPcts.length)
+      out.ramUsedPct = usedPct
+      const criticalEvery = usedPcts.length === snapshots.length && usedPcts.every((v) => v >= cfg.system.ram.criticalUsedPct)
+      const title = `System RAM high (${usedPct}%)`
+      const detail = `${usedPct}% used (${ram.freeMb} MB free of ${ram.totalMb} MB), threshold ${cfg.system.ram.warnUsedPct}%`
+      if (criticalEvery) {
+        out.issues.push({
+          severity: 'error',
+          kind: 'system',
+          title,
+          detail: `${detail} (critical ${cfg.system.ram.criticalUsedPct}%)`,
+          fixed: false,
+          unfixableReason:
+            'not auto-fixed: RAM cannot be freed safely by this plugin. Close the heavyweight processes listed by this check (or wait for running jobs to finish), then re-run.',
+        })
+      } else if (usedPct >= cfg.system.ram.warnUsedPct) {
+        out.issues.push({ severity: 'warn', kind: 'system', title, detail, fixed: false })
+      }
     }
   }
 
-  // CPU load.
-  const cpu = snapshot?.cpu
-  if (Number.isFinite(cpu)) {
-    const cpuPct = Math.round(cpu)
-    if (cpuPct >= cfg.system.cpu.criticalUsedPct) {
+  // Pagefile / commit pressure: Windows commits more memory than physical
+  // RAM, and a full pagefile breaks every allocation even when RAM looks
+  // fine — the classic "out of memory" without high RAM.
+  const pagefile = snapshot?.pagefile
+  if (pagefile && Number.isFinite(pagefile.totalMb) && Number.isFinite(pagefile.freeMb)) {
+    const usedPcts = snapshots
+      .map((s) => {
+        const p = s?.pagefile
+        return p && Number.isFinite(p.totalMb) && Number.isFinite(p.freeMb) ? (100 * (p.totalMb - p.freeMb)) / p.totalMb : null
+      })
+      .filter((v) => v !== null && Number.isFinite(v))
+    if (usedPcts.length) {
+      const usedPct = Math.round(usedPcts.reduce((a, b) => a + b, 0) / usedPcts.length)
+      out.pagefileUsedPct = usedPct
+      const pfCfg = cfg.system.pagefile ?? cfg.system.ram
+      const title = `Pagefile/commit high (${usedPct}%)`
+      const detail = `${usedPct}% of the pagefile+RAM commit limit used (${pagefile.freeMb} MB free of ${pagefile.totalMb} MB), threshold ${pfCfg.warnUsedPct}%`
+      if (usedPcts.length === snapshots.length && usedPcts.every((v) => v >= pfCfg.criticalUsedPct)) {
+        out.issues.push({
+          severity: 'error',
+          kind: 'system',
+          title,
+          detail: `${detail} (critical ${pfCfg.criticalUsedPct}%). Commit exhaustion fails every new allocation — close or restart the leaking process, then re-run.`,
+          fixed: false,
+          unfixableReason: 'not auto-fixed: commit memory cannot be freed safely by this plugin. Close the heavyweight processes listed by this check, then re-run.',
+        })
+      } else if (usedPct >= pfCfg.warnUsedPct) {
+        out.issues.push({ severity: 'warn', kind: 'system', title, detail, fixed: false })
+      }
+    }
+  }
+
+  // CPU load (averaged across samples).
+  const cpuMean = mean('cpu')
+  if (cpuMean !== null) {
+    const cpuPct = Math.round(cpuMean)
+    if (allOver('cpu', cfg.system.cpu.criticalUsedPct)) {
       out.issues.push({
         severity: 'error',
         kind: 'system',
@@ -1066,9 +1291,14 @@ async function checkSystem(ctx, cfg, fix) {
     const name = normalizeDriveName(disk.name)
     if (!wanted.has(name)) continue
     if (!Number.isFinite(disk.freeGb) || !Number.isFinite(disk.totalGb) || disk.totalGb <= 0) continue
-    const freePct = Math.round((100 * disk.freeGb) / disk.totalGb)
+    const freePcts = snapshots
+      .map((s) => (s?.disks ?? []).find((d) => normalizeDriveName(d.name) === name))
+      .map((d) => (d && Number.isFinite(d.freeGb) && Number.isFinite(d.totalGb) && d.totalGb > 0 ? (100 * d.freeGb) / d.totalGb : null))
+      .filter((v) => v !== null)
+    if (!freePcts.length) continue
+    const freePct = Math.round(freePcts.reduce((a, b) => a + b, 0) / freePcts.length)
     const detail = `${freePct}% free (${disk.freeGb} GB of ${disk.totalGb} GB) on ${name}:, warn threshold ${cfg.system.disk.warnFreePct}%`
-    if (freePct <= cfg.system.disk.criticalFreePct) {
+    if (freePcts.length === snapshots.length && freePcts.every((v) => v <= cfg.system.disk.criticalFreePct)) {
       out.issues.push({
         severity: 'error',
         kind: 'system',
@@ -1083,14 +1313,18 @@ async function checkSystem(ctx, cfg, fix) {
     }
   }
 
-  // Heavyweight processes.
+  // Heavyweight processes. A process beyond the critical working set is
+  // only an ERROR when the system is ALSO under RAM pressure (it is the
+  // cause of a real problem); otherwise it is a warning, which stops the
+  // check from crying wolf about legitimately large but harmless processes.
   const allowed = new Set((cfg.system.processes.allowedNames ?? []).map((n) => String(n).toLowerCase()))
+  const ramPressure = (out.ramUsedPct ?? 0) >= (cfg.system.ram.warnUsedPct ?? 85) || (out.pagefileUsedPct ?? 0) >= (cfg.system.pagefile?.warnUsedPct ?? 85)
   for (const proc of snapshot?.processes ?? []) {
     if (!Number.isFinite(proc.wsMb)) continue
     const procName = String(proc.name ?? '?')
     if (allowed.has(procName.toLowerCase())) continue
     const detail = `${procName} (pid ${proc.pid}) working set ${proc.wsMb} MB`
-    if (proc.wsMb >= cfg.system.processes.criticalWorkingSetMb) {
+    if (proc.wsMb >= cfg.system.processes.criticalWorkingSetMb && ramPressure) {
       const issue = {
         severity: 'error',
         kind: 'system',
@@ -1116,16 +1350,171 @@ async function checkSystem(ctx, cfg, fix) {
       }
       out.issues.push(issue)
     } else if (proc.wsMb >= cfg.system.processes.warnWorkingSetMb) {
+      const isCriticalWithoutPressure = proc.wsMb >= cfg.system.processes.criticalWorkingSetMb
       out.issues.push({
         severity: 'warn',
         kind: 'system',
-        title: `Heavy process: ${procName}`,
-        detail: `${detail} (warn ${cfg.system.processes.warnWorkingSetMb} MB)`,
+        title: isCriticalWithoutPressure ? `Heavyweight process (no RAM pressure): ${procName}` : `Heavy process: ${procName}`,
+        detail: `${detail} (${isCriticalWithoutPressure ? `critical ${cfg.system.processes.criticalWorkingSetMb} MB but the system is not under RAM pressure, so this stays a warning` : `warn ${cfg.system.processes.warnWorkingSetMb} MB`})`,
         pid: proc.pid,
         fixed: false,
       })
     }
   }
+  return out
+}
+
+/* ------------------------------------------------------------------ */
+/* ports in use (check before binding one)                             */
+/* ------------------------------------------------------------------ */
+
+const NETSTAT_LINE_RE = /^\s*(TCP|UDP)\s+([^\s]+)\s+([^\s]+)\s+(LISTENING)?\s*(\d+)\s*$/i
+
+/**
+ * Listening-port inventory via `netstat -ano` (Windows; skipped elsewhere).
+ * Informational by default; only raises issues for ports listed in
+ * ports.watchPorts — the exact pattern of an EADDRINUSE before it happens.
+ */
+async function checkPorts(ctx, cfg) {
+  const out = { checked: false, issues: [] }
+  if (!cfg.ports?.enabled) {
+    out.note = 'Port check disabled in plugin config.'
+    return out
+  }
+  let exe
+  try {
+    exe = await ctx.subprocess.resolveExecutable('netstat')
+  } catch {
+    out.checked = true
+    out.note = 'netstat not found on this machine; port check skipped.'
+    return out
+  }
+  let text
+  try {
+    text = await runCapture(ctx, [exe, '-ano'], 10000)
+  } catch (error) {
+    out.checked = true
+    out.note = `netstat failed: ${truncate(String(error?.message ?? error))}`
+    return out
+  }
+  out.checked = true
+  // pid → process name via one tasklist call (names are best-effort).
+  const pidName = new Map()
+  try {
+    const tlExe = await ctx.subprocess.resolveExecutable('tasklist')
+    const tlText = await runCapture(ctx, [tlExe, '/FO', 'CSV', '/NH'], 10000)
+    for (const line of String(tlText).split(/\r?\n/)) {
+      const m = line.match(/^"([^"]+)","(\d+)".*/)
+      if (m) pidName.set(m[2], m[1])
+    }
+  } catch {
+    /* names are best-effort */
+  }
+  const listening = []
+  for (const line of String(text).split(/\r?\n/)) {
+    const m = line.match(NETSTAT_LINE_RE)
+    if (!m || !m[4]) continue
+    const proto = m[1].toUpperCase()
+    const local = m[2]
+    const pid = m[5]
+    const portMatch = local.match(/:(\d+)$/)
+    if (!portMatch) continue
+    listening.push({ proto, local, port: Number(portMatch[1]), pid, name: pidName.get(pid) ?? null })
+  }
+  out.listening = listening.slice(0, 20)
+  const watch = (cfg.ports.watchPorts ?? []).map((p) => Number(p)).filter((p) => Number.isFinite(p))
+  for (const port of watch) {
+    const holders = listening.filter((l) => l.port === port)
+    if (!holders.length) continue
+    out.issues.push({
+      severity: 'warn',
+      kind: 'ports',
+      title: `Port ${port} is already in use`,
+      detail: `held by ${holders.map((h) => `${h.name ?? 'pid ' + h.pid} (${h.proto} ${h.local})`).join(', ')} — a server binding this port would fail with EADDRINUSE.`,
+      fixed: false,
+      unfixableReason: "not auto-fixed: the holder process is someone else's work. Pick another port, or stop the holder after confirming it is safe.",
+    })
+  }
+  if (!watch.length && !out.issues.length) {
+    out.note = `${listening.length} listening endpoint(s) found; configure ports.watchPorts to alert on specific ports.`
+  }
+  return out
+}
+
+/* ------------------------------------------------------------------ */
+/* Windows power settings (sleep kills long jobs)                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Active power plan + standby/hibernate timeouts via `powercfg` (Windows;
+ * skipped elsewhere). Only warns when a long-running background job is
+ * active AND the timeouts would let Windows sleep it mid-run.
+ */
+async function checkPower(ctx, cfg) {
+  const out = { checked: false, issues: [] }
+  if (!cfg.power?.enabled) {
+    out.note = 'Power-settings check disabled in plugin config.'
+    return out
+  }
+  let exe
+  try {
+    exe = await ctx.subprocess.resolveExecutable('powercfg')
+  } catch {
+    out.checked = true
+    out.note = 'powercfg not found on this machine; power check skipped.'
+    return out
+  }
+  const read = async (args) => {
+    try {
+      return await runCapture(ctx, [exe, ...args], 10000)
+    } catch {
+      return ''
+    }
+  }
+  let scheme = ''
+  try {
+    const schemeText = await read(['/getactivescheme'])
+    const m = String(schemeText).match(/\(([^)]+)\)\s*$/m)
+    if (m) scheme = m[1].trim()
+  } catch {
+    /* best effort */
+  }
+  const parseIdleSec = (text) => {
+    const m = String(text).match(/Current AC Power Setting Index:\s*0x([0-9a-fA-F]+)/)
+    return m ? Number.parseInt(m[1], 16) : null
+  }
+  const standbySec = parseIdleSec(await read(['/query', 'SCHEME_CURRENT', 'SUB_SLEEP', 'STANDBYIDLE']))
+  const hibernateSec = parseIdleSec(await read(['/query', 'SCHEME_CURRENT', 'SUB_SLEEP', 'HIBERNATEIDLE']))
+  out.checked = true
+  out.scheme = scheme
+  out.standbySec = standbySec
+  out.hibernateSec = hibernateSec
+  const label = (sec) => (sec === 0 ? 'never' : sec == null ? 'unknown' : `${sec}s`)
+  const minStandbySec = (Number(cfg.power.minStandbyMin) || 0) * 60
+  const minHibernateSec = (Number(cfg.power.minHibernateMin) || 0) * 60
+  const standbyTooShort = Number.isFinite(standbySec) && standbySec > 0 && standbySec < minStandbySec
+  const hibernateTooShort = Number.isFinite(hibernateSec) && hibernateSec > 0 && hibernateSec < minHibernateSec
+  if (!standbyTooShort && !hibernateTooShort) {
+    out.note = `Power plan "${scheme || 'unknown'}": standby ${label(standbySec)}, hibernate ${label(hibernateSec)}.`
+    return out
+  }
+  // Only warn when there actually IS a long-running job right now.
+  if (!(await hasRunningJobs(ctx))) {
+    out.note = `Power plan "${scheme || 'unknown'}": sleep timeouts are short but no background job is running; nothing to warn about.`
+    return out
+  }
+  const parts = []
+  if (standbyTooShort) parts.push(`standby after ${standbySec}s (< ${cfg.power.minStandbyMin} min)`)
+  if (hibernateTooShort) parts.push(`hibernate after ${hibernateSec}s (< ${cfg.power.minHibernateMin} min)`)
+  out.issues.push({
+    severity: 'warn',
+    kind: 'power',
+    title: 'System sleep can kill long-running jobs',
+    detail: `active plan "${scheme || 'unknown'}": ${parts.join(', ')} while a background job is running — Windows sleep will suspend and can kill it.`,
+    fixed: false,
+    unfixableReason:
+      'not auto-fixed: changing the power plan is a user setting. In Settings → Power set a longer sleep timeout (or disable sleep) while long jobs run, then re-run.',
+  })
   return out
 }
 
@@ -1139,6 +1528,11 @@ const ERROR_FINGERPRINTS = [
   { key: 'disk', label: 'disk full', re: /no space left|enospc|not enough space|磁盘空间不足|there is not enough space/i },
   { key: 'perm', label: 'permission denied', re: /access is denied|eacces|eperm|permission denied|拒绝访问/i },
   { key: 'dep', label: 'missing dependency', re: /modulenotfounderror|no module named|cannot find module|importerror/i },
+  { key: 'timeout', label: 'timeout', re: /timed out|timed? ?out|deadline exceeded|context deadline|operation timed out|请求超时|连接超时/i },
+  { key: 'ssl', label: 'TLS/certificate failure', re: /\bcertificate\b|self[- ]signed|unable to get (?:local )?issuer|\bssl\b|\btls\b|sslv|tlsv|certificate_verify_failed/i },
+  { key: 'dns', label: 'DNS lookup failure', re: /enotfound|getaddrinfo|no such host|name or service not known|temporary failure in name resolution|dns lookup/i },
+  { key: 'encoding', label: 'encoding/decoding failure', re: /invalid utf-?8|malformed utf|unicodedecodeerror|unicodeencodeerror|surrogate|codec can'?t decode|codec can'?t encode/i },
+  { key: 'notfound', label: 'file not found', re: /enoent|no such file or directory|cannot find the (?:file|path)|file not found|文件不存在|找不到文件/i },
 ]
 
 const FINGERPRINT_GUIDANCE = {
@@ -1147,6 +1541,11 @@ const FINGERPRINT_GUIDANCE = {
   disk: 'the drive is full: free space before continuing; never delete quarantines or backups to make room.',
   perm: 'the process lacks permission for that path/resource: fix the ACL or run with the right account.',
   dep: 'a module is missing: install it into the project venv / project node_modules, never into the DSH profile or runtime.',
+  timeout: 'the command exceeded its time limit: raise the timeout only if the work legitimately needs it, otherwise find the hang.',
+  ssl: 'TLS/certificate verification failed: check the certificate chain, clock skew, or proxy interception; do not blindly disable verification.',
+  dns: 'a hostname did not resolve: check the network, DNS server, or a typo in the hostname.',
+  encoding: 'text was not valid for the expected encoding: re-read with the right encoding instead of guessing.',
+  notfound: 'a required file or path is missing: check the path spelling and whether an earlier step produced it.',
 }
 
 /** Extract a fingerprint from one tools/result execution. Null when benign. */
@@ -1206,7 +1605,8 @@ async function checkErrors(ctx, cfg, state) {
   out.checked = true
   const recent = state.recentToolErrors ?? []
   out.recent = recent.slice(-5).map((e) => `${e.at} ${e.tool}: ${e.label} — ${e.snippet}`)
-  const windowMs = 15 * 60 * 1000
+  const windowMs = Math.max(60 * 1000, Number(cfg.errors.windowMs) || 20 * 60 * 1000)
+  const windowMin = Math.max(1, Math.round(windowMs / 60000))
   const now = Date.now()
   for (const entry of recent) {
     if (!entry.fingerprint) continue
@@ -1223,13 +1623,20 @@ async function checkErrors(ctx, cfg, state) {
   }
   // Failure loops: the same tool failing with the same fingerprint
   // repeatedly is a loop, not a single error (e.g. an infinite retry on a
-  // taken port or a broken dependency).
+  // taken port or a broken dependency). A successful run of that tool
+  // clears its error history (resetOnSuccess), so a loop only counts
+  // consecutive failures since the last success.
   const loopThreshold = Math.max(2, Number(cfg.errors.loopThreshold) || 3)
   const loopCounts = new Map()
   for (const entry of recent) {
     if (!entry.fingerprint) continue
     const at = new Date(entry.at).getTime()
     if (Number.isNaN(at) || now - at > windowMs) continue
+    // Failures from before this tool's last success do not count toward a
+    // loop (the loop resets on success); a single recent error still
+    // surfaces above as factual evidence.
+    const lastOk = state.lastToolSuccess?.get(entry.tool)
+    if (lastOk != null && at <= lastOk) continue
     const key = `${entry.tool}|${entry.fingerprint}`
     loopCounts.set(key, (loopCounts.get(key) ?? 0) + 1)
   }
@@ -1243,7 +1650,7 @@ async function checkErrors(ctx, cfg, state) {
       severity: 'error',
       kind: 'errors',
       title: `Failure loop: ${tool} keeps failing with ${label}`,
-      detail: `${count} identical failures in the last 15 min — a retry loop or a broken dependency, not a one-off error.`,
+      detail: `${count} identical failures since the last success of ${tool} (within ${windowMin} min) — a retry loop or a broken dependency, not a one-off error.`,
       fixed: false,
       unfixableReason: `not auto-fixed: ${FINGERPRINT_GUIDANCE[fpKey] ?? 'inspect the failing command and break the loop.'}`,
     })
@@ -1503,7 +1910,8 @@ async function trialCreate(ctx, cfg, state, args) {
       try { fs.mkdirSync(env.PYTHONPATH, { recursive: true }) } catch { /* best effort */ }
     }
   }
-  const runs = Number(spec.runs) > 0 ? Math.min(Math.floor(Number(spec.runs)), 10) : Number(cfg.trial?.defaultRuns ?? 3)
+  const maxRuns = Math.max(1, Math.floor(Number(cfg.trial?.maxRuns)) || 20)
+  const runs = Number(spec.runs) > 0 ? Math.min(Math.floor(Number(spec.runs)), maxRuns) : Number(cfg.trial?.defaultRuns ?? 5)
   const timeoutSec = Number(spec.timeoutSec) > 0 ? Number(spec.timeoutSec) : Number(cfg.trial?.runTimeoutSec ?? 180)
   const trial = {
     id,
@@ -1540,15 +1948,30 @@ async function trialRun(ctx, cfg, state, args) {
   const timeoutMs = trial.spec.timeoutSec * 1000
   const installTimeoutMs = Number(cfg.trial?.installTimeoutSec ?? 600) * 1000
   const cwd = trial.spec.sourceDir ? `${trial.dir}/src` : trial.dir
-  let gpuBefore = null
-  if (trial.spec.watchGpu) {
-    try { gpuBefore = await queryGpuUsedMiB(ctx) } catch { /* no nvidia-smi */ }
+  // Continuous GPU sampling while the runs execute: a snapshot before the
+  // first run, one after every run, plus the peak observed. The leak check
+  // (end vs start) catches a program that does not release VRAM between
+  // runs; the peak catches transient spikes a single after-snapshot misses.
+  const gpu = { samples: [], beforeMiB: null, afterMiB: null, peakMiB: null }
+  const gpuSample = async (phase) => {
+    if (!trial.spec.watchGpu) return
+    try {
+      const miB = await queryGpuUsedMiB(ctx)
+      if (miB != null) {
+        gpu.samples.push({ phase, miB, at: Date.now() })
+        if (gpu.peakMiB == null || miB > gpu.peakMiB) gpu.peakMiB = miB
+        if (phase === 'before' && gpu.beforeMiB == null) gpu.beforeMiB = miB
+        gpu.afterMiB = miB
+      }
+    } catch { /* no nvidia-smi */ }
   }
+  await gpuSample('before')
   if (trial.spec.installCmd) {
     const argv = splitCommandLine(trial.spec.installCmd)
     const started = Date.now()
     const res = await runTrialCommand(ctx, argv, { cwd, env: trial.env, timeoutMs: installTimeoutMs })
     trial.steps.push({ at: new Date().toISOString(), kind: 'install', argv: truncate(trial.spec.installCmd, 200), exitCode: res.exitCode, timedOut: res.timedOut, durationMs: Date.now() - started, stdoutTail: truncate(res.stdout, 2000), stderrTail: truncate(res.stderr, 2000), spawnError: res.spawnError ?? null })
+    await gpuSample('after-install')
   }
   const runCmd = String(trial.spec.runCmd ?? '')
   const runArgv = splitCommandLine(runCmd)
@@ -1556,6 +1979,7 @@ async function trialRun(ctx, cfg, state, args) {
     const started = Date.now()
     const res = await runTrialCommand(ctx, runArgv, { cwd, env: trial.env, timeoutMs })
     trial.steps.push({ at: new Date().toISOString(), kind: 'run', runIndex: i + 1, argv: truncate(runCmd, 200), exitCode: res.exitCode, timedOut: res.timedOut, durationMs: Date.now() - started, stdoutTail: truncate(res.stdout, 2000), stderrTail: truncate(res.stderr, 2000), spawnError: res.spawnError ?? null })
+    await gpuSample(`run-${i + 1}`)
   }
   trial.status = 'ran'
   const runs = trial.steps.slice(stepStart).filter((s) => s.kind === 'run')
@@ -1565,9 +1989,20 @@ async function trialRun(ctx, cfg, state, args) {
   out.passCount = runs.filter((s) => s.exitCode === 0 && !s.timedOut).length
   out.failCount = runs.length - out.passCount
   out.steps = trial.steps.slice(stepStart).map(stepSummary)
-  out.gpuBeforeMiB = gpuBefore
   if (trial.spec.watchGpu) {
-    try { out.gpuAfterMiB = await queryGpuUsedMiB(ctx) } catch { /* no nvidia-smi */ }
+    trial.gpu = gpu
+    out.gpu = {
+      beforeMiB: gpu.beforeMiB,
+      afterMiB: gpu.afterMiB,
+      peakMiB: gpu.peakMiB,
+      samples: gpu.samples.slice(0, 60).map((s) => `${s.phase}:${s.miB}`),
+    }
+    const leakWarnMiB = Number(cfg.trial?.gpuLeakWarnMiB) || 200
+    if (gpu.beforeMiB != null && gpu.afterMiB != null && gpu.afterMiB - gpu.beforeMiB > leakWarnMiB) {
+      out.gpuLeakMiB = Math.round(gpu.afterMiB - gpu.beforeMiB)
+      out.gpuLeakWarning = `VRAM usage grew ${out.gpuLeakMiB} MiB from before the first run to after the last run (> ${leakWarnMiB} MiB) — the program may be leaking GPU memory between runs.`
+      trial.issues = [...(trial.issues ?? []), { severity: 'warn', kind: 'trial', title: 'GPU memory leak suspected', detail: out.gpuLeakWarning, fixed: false }]
+    }
   }
   return out
 }
@@ -1596,11 +2031,82 @@ async function trialAnalyze(ctx, cfg, state, args) {
     out.error = 'no runs recorded yet; call action "run" first.'
     return out
   }
+  const timeoutMs = (Number(trial.spec.timeoutSec) > 0 ? Number(trial.spec.timeoutSec) : 180) * 1000
   const runText = (run) => `${run.stdoutTail ?? ''}\n${run.stderrTail ?? ''}`
   const failed = runs.filter((s) => s.exitCode !== 0 || s.timedOut)
   const passed = runs.length - failed.length
   const issues = []
   const seen = new Set()
+  // Declared expectations (spec.expect): the trial author's acceptance
+  // criteria, asserted on every run of the current attempt.
+  const expect = trial.spec.expect ?? null
+  const expectOutputMatches = (s) => {
+    if (!expect?.outputMatches) return true
+    const re = toRegExp(expect.outputMatches)
+    if (re instanceof RegExp) return re.test(runText(s))
+    return runText(s).includes(String(expect.outputMatches))
+  }
+  const expectOutputNotMatches = (s) => {
+    if (!expect?.outputNotMatches) return true
+    const re = toRegExp(expect.outputNotMatches)
+    if (re instanceof RegExp) return !re.test(runText(s))
+    return !runText(s).includes(String(expect.outputNotMatches))
+  }
+  if (expect) {
+    const expectedExit = Number.isFinite(Number(expect.exitCode)) ? Number(expect.exitCode) : 0
+    const wrongExit = runs.filter((s) => s.exitCode !== null && s.exitCode !== expectedExit && !s.timedOut)
+    if (wrongExit.length) {
+      issues.push({
+        severity: 'error',
+        kind: 'trial',
+        title: 'Unexpected exit code',
+        detail: `expected exit ${expectedExit} but ${wrongExit.length}/${runs.length} run(s) exited differently (${[...new Set(wrongExit.map((s) => s.exitCode))].join(', ')}).`,
+        unfixableReason: 'not auto-fixed: review the failing runs and the declared expectation, then fix the program or correct spec.expect.',
+      })
+    }
+    const missing = runs.filter((s) => !expectOutputMatches(s))
+    if (missing.length) {
+      issues.push({
+        severity: 'error',
+        kind: 'trial',
+        title: 'Expected output missing',
+        detail: `spec.expect.outputMatches ${JSON.stringify(String(expect.outputMatches))} was not found in ${missing.length}/${runs.length} run(s).`,
+        evidence: truncate((missing[0].stderrTail || missing[0].stdoutTail || '').replace(/\s+/g, ' '), 240),
+        unfixableReason: 'not auto-fixed: make the program produce the expected output, or correct spec.expect.',
+      })
+    }
+    const forbidden = runs.filter((s) => !expectOutputNotMatches(s))
+    if (forbidden.length) {
+      issues.push({
+        severity: 'error',
+        kind: 'trial',
+        title: 'Forbidden output present',
+        detail: `spec.expect.outputNotMatches ${JSON.stringify(String(expect.outputNotMatches))} was found in ${forbidden.length}/${runs.length} run(s).`,
+        evidence: truncate((forbidden[0].stderrTail || forbidden[0].stdoutTail || '').replace(/\s+/g, ' '), 240),
+        unfixableReason: 'not auto-fixed: remove the forbidden output from the program, or correct spec.expect.',
+      })
+    }
+  }
+  // Near-timeout flag: a run that finished just under its timeout is as
+  // suspicious as a timeout — the next change could push it over.
+  const nearTimeout = runs.filter((s) => !s.timedOut && Number.isFinite(s.durationMs) && s.durationMs >= timeoutMs * 0.9)
+  for (const run of nearTimeout) {
+    issues.push({
+      severity: 'warn',
+      kind: 'trial',
+      title: `Run #${run.runIndex} nearly timed out`,
+      detail: `finished in ${run.durationMs}ms against a ${timeoutMs}ms timeout (≥90%) — fragile; raise spec.timeoutSec or make the program faster.`,
+      fixed: false,
+    })
+  }
+  // Duration statistics for the current attempt.
+  const durations = runs.map((s) => s.durationMs).filter((d) => Number.isFinite(d))
+  out.durationsMs = {
+    total: durations.reduce((a, b) => a + b, 0),
+    min: durations.length ? Math.min(...durations) : null,
+    max: durations.length ? Math.max(...durations) : null,
+    avg: durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null,
+  }
   for (const run of failed) {
     const text = runText(run)
     let fp = null
@@ -1644,12 +2150,33 @@ async function trialAnalyze(ctx, cfg, state, args) {
       fixed: false,
     })
   }
+  // Re-derive the GPU leak warning from the run-time samples: trialRun
+  // records it, and this keeps it in the analysis even after trial.issues
+  // is rebuilt below (so it survives re-analyze and reaches the export
+  // manifest verdict).
+  if (trial.spec.watchGpu) {
+    const leakWarnMiB = Number(cfg.trial?.gpuLeakWarnMiB) || 200
+    const g = trial.gpu
+    if (g && g.beforeMiB != null && g.afterMiB != null && g.afterMiB - g.beforeMiB > leakWarnMiB) {
+      const grown = Math.round(g.afterMiB - g.beforeMiB)
+      issues.push({
+        severity: 'warn',
+        kind: 'trial',
+        title: 'GPU memory leak suspected',
+        detail: `VRAM usage grew ${grown} MiB from before the first run to after the last run (> ${leakWarnMiB} MiB) — the program may be leaking GPU memory between runs.`,
+        fixed: false,
+      })
+    }
+  }
   trial.issues = issues
   trial.proposedFixes = buildProposedFixes(trial, failed)
   trial.status = 'analyzed'
+  const errorIssues = issues.filter((i) => i.severity === 'error')
+  out.verdict = errorIssues.length ? 'failed' : passed > 0 && failed.length > 0 ? 'flaky' : 'clean'
   out.ok = true
   out.trialId = trial.id
   out.status = 'analyzed'
+  out.verdict = out.verdict
   out.passCount = passed
   out.failCount = failed.length
   out.issues = issues
@@ -1777,6 +2304,14 @@ async function trialExport(ctx, cfg, state, args) {
     return out
   }
   const EXCLUDE = new Set(['venv', 'home', 'tmp', 'pip-cache', 'npm-cache'])
+  let fileCount = 0
+  const countFiles = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) countFiles(full)
+      else fileCount += 1
+    }
+  }
   try {
     fs.rmSync(destRaw, { recursive: true, force: true })
     fs.mkdirSync(destRaw, { recursive: true })
@@ -1788,6 +2323,26 @@ async function trialExport(ctx, cfg, state, args) {
         fs.cpSync(path.join(src, entry.name), path.join(destRaw, entry.name), { recursive: true })
       }
     }
+    countFiles(destRaw)
+    // Self-describing manifest alongside the product: what ran, how it
+    // behaved, and the verdict, so the exported artifact carries its own
+    // evidence instead of relying on plugin memory.
+    const manifest = {
+      trialId: trial.id,
+      name: trial.spec.name ?? null,
+      exportedAt: new Date().toISOString(),
+      verdict: trial.issues?.some((i) => i.severity === 'error') ? 'failed' : (trial.issues ?? []).length ? 'flaky' : 'clean',
+      fileCount,
+      runCmd: trial.spec.runCmd ?? null,
+      runs: (trial.steps.filter((s) => s.kind === 'run') ?? []).map((s) => ({
+        runIndex: s.runIndex ?? null,
+        exitCode: s.exitCode,
+        timedOut: s.timedOut === true,
+        durationMs: s.durationMs,
+      })),
+      issues: (trial.issues ?? []).map((i) => ({ severity: i.severity, title: i.title, detail: i.detail ?? '' })),
+    }
+    fs.writeFileSync(path.join(destRaw, 'trial-report.json'), JSON.stringify(manifest, null, 2), 'utf8')
   } catch (error) {
     out.error = `export failed: ${error.message}`
     return out
@@ -1798,6 +2353,8 @@ async function trialExport(ctx, cfg, state, args) {
   out.trialId = trial.id
   out.exportedTo = destRaw
   out.status = 'exported'
+  out.fileCount = fileCount
+  out.manifest = path.join(destRaw, 'trial-report.json')
   out.note = 'The verified product is now at the exported path — present it to the user as the final artifact.'
   return out
 }
@@ -1838,12 +2395,29 @@ function trialStatus(state, args) {
 async function trialCleanup(state, args) {
   const out = { ok: false }
   const id = String(args.trialId ?? '').trim()
+  const fs = await getFs()
+  if (id === 'all') {
+    const removed = []
+    for (const trial of [...state.trials.values()]) {
+      try {
+        fs.rmSync(trial.dir, { recursive: true, force: true })
+        state.trials.delete(trial.id)
+        removed.push({ trialId: trial.id, dir: trial.dir })
+      } catch (error) {
+        removed.push({ trialId: trial.id, error: String(error?.message ?? error) })
+      }
+    }
+    out.ok = removed.length > 0
+    out.trialId = 'all'
+    out.removed = removed
+    out.note = `${removed.length} sandbox(es) removed. If a product was exported, the exported copy is untouched.`
+    return out
+  }
   const trial = state.trials.get(id)
   if (!trial) {
     out.error = `unknown trialId "${id}"`
     return out
   }
-  const fs = await getFs()
   try {
     fs.rmSync(trial.dir, { recursive: true, force: true })
   } catch (error) {
@@ -1878,7 +2452,10 @@ function renderTrial(value) {
   const lines = []
   if (value.note) lines.push(value.note)
   if (value.trialId) lines.push(`Trial: ${value.trialId} [${value.status}]${value.dir ? ' @ ' + value.dir : ''}`)
-  if (value.exportedTo) lines.push(`Exported to: ${value.exportedTo}`)
+  if (value.verdict) lines.push(`Verdict: ${value.verdict.toUpperCase()}${value.durationsMs ? ` — total ${value.durationsMs.total}ms, avg ${value.durationsMs.avg}ms, max ${value.durationsMs.max}ms (runs)` : ''}`)
+  if (value.exportedTo) lines.push(`Exported to: ${value.exportedTo}${value.fileCount != null ? ` (${value.fileCount} files)` : ''}`)
+  if (value.manifest) lines.push(`Manifest: ${value.manifest}`)
+  if (value.gpuLeakWarning) lines.push(`WARNING: ${value.gpuLeakWarning}`)
   if (value.passCount != null && !(value.issues?.length)) lines.push(`${value.passCount} run(s) passed, ${value.failCount} failed.`)
   if (Array.isArray(value.issues) && value.issues.length) {
     for (const issue of value.issues) {
@@ -1956,54 +2533,73 @@ async function monitorTick(ctx, cfg, state) {
   state.tickCount += 1
   state.stats.ticks += 1
   const watching = withinDeployWindow(state, cfg) || (await hasRunningJobs(ctx))
+  const alerts = []
+  const cooldownMs = Math.max(0, Number(cfg.monitor.alertCooldownMs) || 0)
+  const pushAlert = (key, line) => {
+    const last = state.alertedAt.get(key) ?? 0
+    if (cooldownMs > 0 && Date.now() - last < cooldownMs) return
+    state.alertedAt.set(key, Date.now())
+    alerts.push(line)
+  }
+  const pushIssues = (prefix, lead, issues, minSeverity) => {
+    for (const issue of issues ?? []) {
+      if (minSeverity && issue.severity !== minSeverity) continue
+      pushAlert(`${prefix}:${issue.jobId ?? issue.title}`, `${lead}: ${issue.title} — ${issue.detail}.`)
+    }
+  }
   if (!watching) {
-    state.alertedKeys.clear()
+    // Idle heartbeat: outside the deployment window run a light round of
+    // checks on a long cadence so a machine can still catch a critical
+    // condition (OOM-level RAM pressure, a stuck job) while idle. Only
+    // error-severity findings alert; the alert cooldown still applies.
+    const heartbeatMs = Math.max(1000, Number(cfg.monitor.idleHeartbeatMs) || 5 * 60 * 1000)
+    const due = Date.now() - (state.lastIdleCheckAt ?? 0) >= heartbeatMs
     state.tickCount = 0
+    if (!due) return
+    state.lastIdleCheckAt = Date.now()
+    if (cfg.gpu.enabled) {
+      const gpu = await checkGpu(ctx, cfg, false, false, state, false, 'single')
+      pushIssues('gpu', 'GPU alert', gpu.issues, 'error')
+    }
+    if (cfg.stuckJobs.enabled) {
+      const stuck = await checkStuckJobs(ctx, cfg, false)
+      pushIssues('job', 'Stuck job alert', stuck.issues, 'error')
+    }
+    if (cfg.system?.enabled) {
+      try {
+        const system = await checkSystem(ctx, cfg, false, 'single')
+        pushIssues('sys', 'System alert', system.issues, 'error')
+      } catch { /* system scan best-effort */ }
+    }
+    if (alerts.length) notifyAgents(ctx, 'Capability safety monitor (idle): ' + alerts.join(' '), state)
     return
   }
   const heavyEvery = Math.max(1, Math.floor(Number(cfg.monitor.heavyEveryNTicks) || 6))
   const heavy = state.tickCount === 1 || state.tickCount % heavyEvery === 0
-  const alerts = []
-  const pushAlert = (key, line) => {
-    if (state.alertedKeys.has(key)) return
-    state.alertedKeys.add(key)
-    alerts.push(line)
-  }
   if (cfg.gpu.enabled) {
-    const gpu = await checkGpu(ctx, cfg, false, false, state)
-    for (const issue of gpu.issues ?? []) {
-      pushAlert(`gpu:${issue.title}`, `GPU alert: ${issue.title} — ${issue.detail}.`)
-    }
+    const gpu = await checkGpu(ctx, cfg, false, false, state, false, 'single')
+    pushIssues('gpu', 'GPU alert', gpu.issues)
   }
   if (heavy && cfg.stuckJobs.enabled) {
     const stuck = await checkStuckJobs(ctx, cfg, false)
-    for (const issue of stuck.issues ?? []) {
-      pushAlert(`job:${issue.jobId ?? issue.title}`, `Stuck job alert: ${issue.title} — ${issue.detail}.`)
-    }
+    pushIssues('job', 'Stuck job alert', stuck.issues)
   }
   if (heavy) {
     await checkPlugins(ctx, cfg, state)
     if (cfg.installGuard?.enabled) {
       try {
         const versions = await checkBundleVersions(ctx, cfg)
-        for (const issue of versions.issues ?? []) {
-          pushAlert(`ver:${issue.title}`, `Version alert: ${issue.title} — ${issue.detail}.`)
-        }
+        pushIssues('ver', 'Version alert', versions.issues)
       } catch { /* version scan best-effort */ }
       try {
         const core = await checkCoreChain(ctx, cfg)
-        for (const issue of core.issues ?? []) {
-          if (issue.severity !== 'error') continue
-          pushAlert(`core:${issue.title}`, `Core-chain alert: ${issue.title} — ${issue.detail}.`)
-        }
+        pushIssues('core', 'Core-chain alert', core.issues, 'error')
       } catch { /* core scan best-effort */ }
     }
     if (cfg.system?.enabled) {
       try {
-        const system = await checkSystem(ctx, cfg, false)
-        for (const issue of system.issues ?? []) {
-          pushAlert(`sys:${issue.title}`, `System alert: ${issue.title} — ${issue.detail}.`)
-        }
+        const system = await checkSystem(ctx, cfg, false, 'single')
+        pushIssues('sys', 'System alert', system.issues)
       } catch { /* system scan best-effort */ }
     }
   }
@@ -2061,6 +2657,8 @@ async function runChecks(ctx, cfg, state, args) {
   const wantSystem = args.system !== false
   const wantErrors = args.errors !== false
   const wantSelf = args.self !== false
+  const wantPorts = args.ports !== false
+  const wantPower = args.power !== false
   const fix = args.fix === true
 
   const checks = {}
@@ -2073,8 +2671,10 @@ async function runChecks(ctx, cfg, state, args) {
     wantSystem ? checkSystem(ctx, cfg, fix) : null,
     wantErrors ? checkErrors(ctx, cfg, state) : null,
     wantSelf ? checkSelf(ctx, cfg, state) : null,
+    wantPorts ? checkPorts(ctx, cfg) : null,
+    wantPower ? checkPower(ctx, cfg) : null,
   ])
-  const names = ['gpu', 'stuckJobs', 'plugins', 'versions', 'coreChain', 'system', 'errors', 'self']
+  const names = ['gpu', 'stuckJobs', 'plugins', 'versions', 'coreChain', 'system', 'errors', 'self', 'ports', 'power']
   const issues = []
   results.forEach((result, index) => {
     if (result.status === 'fulfilled' && result.value) {
@@ -2099,6 +2699,26 @@ async function runChecks(ctx, cfg, state, args) {
       detail: `${state.pendingRestart.note} (since ${state.pendingRestart.at}) — the change is not live until the next restart; re-run this check after restarting to confirm.`,
       fixed: false,
     })
+  }
+
+  // Deploy readiness: combine GPU free% and RAM free% (worst wins), so a
+  // GPU-heavy deploy is not blessed while system RAM is already exhausted
+  // (or vice versa). Only when both checks actually ran.
+  const gpuDeploy = checks.gpu?.deploy
+  const ramUsedPct = Number(checks.system?.ramUsedPct)
+  if (gpuDeploy?.verdict && Number.isFinite(ramUsedPct)) {
+    const ramFreePct = Math.max(0, 100 - ramUsedPct)
+    const combinedFreePct = Math.min(gpuDeploy.freePct, ramFreePct)
+    const stopFreePct = Number(cfg.deploy.stopFreePct) || 10
+    const goFreePct = Number(cfg.deploy.goFreePct) || 25
+    const ramStopFreePct = Number(cfg.deploy.ramStopFreePct) || 8
+    const ramGoFreePct = Number(cfg.deploy.ramGoFreePct) || 15
+    let verdict = 'go'
+    if (ramFreePct < ramStopFreePct || combinedFreePct < stopFreePct) verdict = 'stop'
+    else if (ramFreePct < ramGoFreePct || combinedFreePct < goFreePct) verdict = 'caution'
+    gpuDeploy.ramFreePct = Math.round(ramFreePct * 10) / 10
+    gpuDeploy.combinedFreePct = Math.round(combinedFreePct * 10) / 10
+    gpuDeploy.verdict = verdict
   }
 
   const openErrors = issues.filter((issue) => issue.severity === 'error' && issue.fixed !== true)
@@ -2142,7 +2762,10 @@ function renderReport(value) {
   const deploy = value?.checks?.gpu?.deploy
   if (deploy?.verdict) {
     const upper = deploy.verdict.toUpperCase()
-    lines.push(`GPU deploy readiness: ${upper} — ${deploy.freeMiB} MiB free (${deploy.freePct}%)${deploy.holders?.length ? `; ${deploy.holdersLabel ?? 'top holders'}: ` + deploy.holders.join(', ') : ''}`)
+    let line = `GPU deploy readiness: ${upper} — GPU ${deploy.freePct}% free (${deploy.freeMiB} MiB)`
+    if (Number.isFinite(deploy.ramFreePct)) line += `, RAM ${deploy.ramFreePct}% free, combined ${deploy.combinedFreePct}% free`
+    if (deploy.holders?.length) line += `; ${deploy.holdersLabel ?? 'top holders'}: ${deploy.holders.join(', ')}`
+    lines.push(line)
   }
   const selfStats = value?.checks?.self?.stats
   if (selfStats) {
@@ -2171,11 +2794,15 @@ export function apply(ctx, config) {
     debounceTimer: null,
     disposed: false,
     disabledByUs: new Set(),
-    alertedKeys: new Set(),
+    alertedAt: new Map(),
+    pendingSince: new Map(),
+    fingerprintNotifiedAt: new Map(),
+    lastIdleCheckAt: Date.now(),
     tickCount: 0,
     pendingRestart: null,
     restartNotified: false,
     recentToolErrors: [],
+    lastToolSuccess: new Map(),
     gpuSamples: [],
     trials: new Map(),
     stats: {
@@ -2202,18 +2829,20 @@ export function apply(ctx, config) {
   const disposeTool = ctx.tools.register({
     name: 'capability_safety_check',
     description:
-      'Run a capability safety check. Call this right after you add or upgrade any capability in this session: installing, upgrading, or enabling a plugin or bundle, registering a new tool or skill, adding or changing an MCP server, or changing the agent preset, model, or adapter. Checks GPU memory pressure (per-GPU usage, driver version, temperature/throttling, per-process VRAM consumers, rising-memory trends), long-running background jobs, plugin activation health, installed @deepseek-ai version channels, core plugin chain health, pending-restart changes, system resources (RAM, CPU load, drive free space, heavyweight processes), recent tool-error fingerprints (OOM, port conflict, disk full, permission, missing module) and repeated-failure loops, and the guardian\'s own health. Non-destructive fixes are always applied (e.g. disabling a plugin that failed to activate). Pass fix: true to also apply destructive fixes the plugin config allows (killing stuck jobs, GPU processes, or heavyweight system processes). If the result reports an unfixable problem, explain to the user why it cannot be fixed automatically and what they can do.',
+      'Run a capability safety check. Call this right after you add or upgrade any capability in this session: installing, upgrading, or enabling a plugin or bundle, registering a new tool or skill, adding or changing an MCP server, or changing the agent preset, model, or adapter. Checks GPU memory pressure (multi-sampled per-GPU usage, driver version, temperature/throttling, utilization/fan/power extras, per-process VRAM consumers, rising-memory trends), long-running background jobs, plugin activation health (with a pending grace period), installed @deepseek-ai version channels, core plugin chain health, pending-restart changes, system resources (multi-sampled RAM/CPU/pagefile, drive free space, heavyweight processes), listening ports (watch list), Windows power settings (sleep killing long jobs), recent tool-error fingerprints (OOM, port conflict, disk full, permission, missing module, timeout, TLS, DNS, encoding, missing file) and repeated-failure loops (reset on a tool success), and the guardian\'s own health. Non-destructive fixes are always applied (e.g. disabling a plugin that failed to activate). Pass fix: true to also apply destructive fixes the plugin config allows (killing stuck jobs, GPU processes, or heavyweight system processes). If the result reports an unfixable problem, explain to the user why it cannot be fixed automatically and what they can do.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        gpu: { type: 'boolean', description: 'Check GPU memory usage (default true).' },
+        gpu: { type: 'boolean', description: 'Check GPU memory usage, temperature, driver, extras and consumers (default true).' },
         stuck: { type: 'boolean', description: 'Check background jobs that have been running suspiciously long (default true).' },
         plugins: { type: 'boolean', description: 'Check plugin activation health (default true).' },
         versions: { type: 'boolean', description: 'Check installed @deepseek-ai package versions/channels for prerelease or mixed-channel hazards (default true).' },
         coreChain: { type: 'boolean', description: 'Check whether core plugins (storage/workspace/session/domain/gateway) are disabled, failed, or carry compatibility warnings (default true).' },
-        system: { type: 'boolean', description: 'Check system resources: RAM pressure, free space on the workspace/profile drives, heavyweight processes (default true).' },
-        errors: { type: 'boolean', description: 'Report recent tool-error fingerprints from this session (OOM, port conflict, disk full, permission, missing module) and repeated-failure loops (default true).' },
+        system: { type: 'boolean', description: 'Check system resources: multi-sampled RAM/CPU/pagefile pressure, free space on the workspace/profile drives, heavyweight processes (default true).' },
+        errors: { type: 'boolean', description: 'Report recent tool-error fingerprints (OOM, port conflict, disk full, permission, missing module, timeout, TLS, DNS, encoding, missing file) and repeated-failure loops (default true).' },
+        ports: { type: 'boolean', description: 'List listening ports and alert on ports.watchPorts entries already in use (default true).' },
+        power: { type: 'boolean', description: 'Check the Windows power plan: sleep/hibernate timeouts that could kill long-running background jobs (default true).' },
         self: { type: 'boolean', description: 'Report the guardian\'s own health: uptime, monitor ticks, change events, alerts sent, auto-fixes, and GPU sampling success/failure (default true).' },
         fix: { type: 'boolean', description: 'Also apply destructive fixes the plugin config allows: killing stuck background jobs, GPU processes, and heavyweight system processes (default false).' },
       },
@@ -2241,13 +2870,13 @@ export function apply(ctx, config) {
   const disposeTrialTool = ctx.tools.register({
     name: 'safe_trial_run',
     description:
-      'Run new software (or newly installed packages/tools) inside an isolated sandbox before it touches anything real: create a trial, install and execute it several times, analyze crashes and error fingerprints, propose fixes, apply only user-approved fixes, and export the verified product. Workflow: action "create" (spec: {name?, sourceDir?, lang?: "python"|"node"|"none", installCmd?, runCmd, runs?, timeoutSec?, watchGpu?}) -> action "run" -> action "analyze" -> report issues + proposedFixes to the USER -> action "fix" with ONLY the fixes the user approved (fixes: [{type:"run",cmd} | {type:"file",path,content} | {type:"note",label}], all applied strictly inside the sandbox) -> "run" + "analyze" until clean -> action "export" (outputDir must be outside the sandbox) -> present the exported path as the final artifact. Isolation is files/environment/process level (own dir, venv for python, cleaned HOME/TEMP/PIP/NPM env, per-run timeouts); it is NOT a VM — GPU and OS are shared. The tool never touches the DSH profile or install dirs, and trial metadata lives only in plugin memory (lost on restart); use action "status" to list trials and "cleanup" to remove a sandbox.',
+      'Run new software (or newly installed packages/tools) inside an isolated sandbox before it touches anything real: create a trial, install and execute it several times, analyze crashes, error fingerprints, durations and declared expectations, propose fixes, apply only user-approved fixes, and export the verified product. Workflow: action "create" (spec: {name?, sourceDir?, lang?: "python"|"node"|"none", installCmd?, runCmd, runs?, timeoutSec?, watchGpu?, expect?}) -> action "run" -> action "analyze" -> report issues + proposedFixes to the USER -> action "fix" with ONLY the fixes the user approved (fixes: [{type:"run",cmd} | {type:"file",path,content} | {type:"note",label}], all applied strictly inside the sandbox) -> "run" + "analyze" until clean -> action "export" (outputDir must be outside the sandbox) -> present the exported path as the final artifact. Isolation is files/environment/process level (own dir, venv for python, cleaned HOME/TEMP/PIP/NPM env, per-run timeouts); it is NOT a VM — GPU and OS are shared. watchGpu samples VRAM continuously during the runs (peaks and leak detection). The tool never touches the DSH profile or install dirs, and trial metadata lives only in plugin memory (lost on restart); use action "status" to list trials and "cleanup" to remove a sandbox (trialId "all" removes every trial).',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: { type: 'string', description: 'One of: create, run, analyze, fix, export, status, cleanup (required).' },
-        trialId: { type: 'string', description: 'Trial id (lowercase letters/digits/-/_). Required for run/analyze/fix/export/cleanup; optional for create (auto-generated).' },
+        trialId: { type: 'string', description: 'Trial id (lowercase letters/digits/-/_). Required for run/analyze/fix/export/cleanup; optional for create (auto-generated); "all" removes every trial for cleanup.' },
         spec: {
           type: 'object',
           additionalProperties: false,
@@ -2257,13 +2886,23 @@ export function apply(ctx, config) {
             lang: { type: 'string', description: 'Runtime language: "python" (creates a sandbox venv), "node", or "none" (default none).' },
             installCmd: { type: 'string', description: 'Optional install command run once before the runs, e.g. "pip install -r requirements.txt" (in a python trial use plain pip; the venv is on PATH).' },
             runCmd: { type: 'string', description: 'REQUIRED for create: the command line to execute each run, e.g. "python app.py" or "node server.js". Split on spaces with quote support; no pipes/redirection — wrap such commands in cmd /c "..." when needed.' },
-            runs: { type: 'number', description: 'How many times to run runCmd (1-10, default 3).' },
+            runs: { type: 'number', description: 'How many times to run runCmd (1-20, default 5).' },
             timeoutSec: { type: 'number', description: 'Per-run timeout in seconds (default 180).' },
-            watchGpu: { type: 'boolean', description: 'Also snapshot GPU VRAM usage before/after the runs (default false).' },
+            watchGpu: { type: 'boolean', description: 'Sample GPU VRAM continuously while each run executes: records per-run peaks and flags leaks (end-of-run usage well above the start, default false).' },
+            expect: {
+              type: 'object',
+              additionalProperties: false,
+              description: 'Optional expectations the analyze step asserts against every run: a wrong exit code, a missing expected output, or a forbidden output string is reported as a finding (not auto-fixed).',
+              properties: {
+                exitCode: { type: 'number', description: 'Expected exit code for each run (default 0).' },
+                outputMatches: { type: 'string', description: 'String (or /regex/) that every run output must contain.' },
+                outputNotMatches: { type: 'string', description: 'String (or /regex/) that no run output may contain.' },
+              },
+            },
           },
         },
         fixes: { type: 'array', description: 'For action "fix": only the fixes the USER approved. Entries: {type:"run",cmd} runs a command in the sandbox; {type:"file",path,content} writes a file inside the sandbox (path is sandbox-relative, escaping paths are refused); {type:"note",label} records a note.' },
-        outputDir: { type: 'string', description: 'For action "export": absolute destination directory for the verified product (must be OUTSIDE the sandbox, e.g. a workspace folder). Default: exportsRoot/<name>.' },
+        outputDir: { type: 'string', description: 'For action "export": absolute destination directory for the verified product (must be OUTSIDE the sandbox, e.g. a workspace folder). Default: exportsRoot/<name>. A trial-report.json manifest (runs, findings, verdict, file count) is written alongside.' },
         overwrite: { type: 'boolean', description: 'For action "export": replace a non-empty outputDir (default false).' },
       },
       required: ['action'],
@@ -2305,21 +2944,35 @@ export function apply(ctx, config) {
 
   // 3b. Tool-error fingerprint watch: record every failing tool result and
   //     notify live agents on critical fingerprints (OOM / port / disk /
-  //     permission / missing module). Non-waking inbox injection.
+  //     permission / missing module / timeout / TLS / DNS / encoding /
+  //     missing file). Non-waking inbox injection, per-fingerprint cooldown
+  //     so a persistent failure cannot spam the inbox; a successful run of
+  //     a tool clears that tool's error history (loop reset).
   if (cfg.errors?.enabled) {
     const offErrors = ctx.on('tools/result', (exec, result) => {
       if (state.disposed) return
       try {
         const entry = extractToolError(exec?.name, result)
-        if (!entry) return
+        if (!entry) {
+          // Benign (successful) result: remember when this tool last
+          // succeeded so failure-loop counting below only considers
+          // failures since then (the loop resets on success).
+          if (exec?.name) state.lastToolSuccess.set(exec.name, Date.now())
+          return
+        }
         state.recentToolErrors.push(entry)
         if (state.recentToolErrors.length > cfg.maxRecentChanges * 2) state.recentToolErrors.shift()
         if (entry.fingerprint && cfg.errors?.notifyOnCritical) {
-          notifyAgents(
-            ctx,
-            `Capability safety: a tool run just failed with a ${entry.label} signature (${entry.tool}): ${entry.snippet}. ${FINGERPRINT_GUIDANCE[entry.fingerprint] ?? ''}`.trim(),
-            state,
-          )
+          const cooldownMs = Math.max(0, Number(cfg.errors.notifyCooldownMs) || 0)
+          const last = state.fingerprintNotifiedAt.get(entry.fingerprint) ?? 0
+          if (Date.now() - last >= cooldownMs) {
+            state.fingerprintNotifiedAt.set(entry.fingerprint, Date.now())
+            notifyAgents(
+              ctx,
+              `Capability safety: a tool run just failed with a ${entry.label} signature (${entry.tool}): ${entry.snippet}. ${FINGERPRINT_GUIDANCE[entry.fingerprint] ?? ''}`.trim(),
+              state,
+            )
+          }
         }
       } catch {
         /* result shapes are best-effort */
@@ -2334,8 +2987,8 @@ export function apply(ctx, config) {
     const intervalMs = Number(cfg.monitor.intervalMs)
     if (Number.isFinite(intervalMs) && intervalMs > 0) {
       const tick = () => {
-        if (state.disposed) return
-        monitorTick(ctx, cfg, state).catch(() => { /* silent */ })
+        if (state.disposed) return Promise.resolve()
+        return monitorTick(ctx, cfg, state).catch(() => { /* silent */ })
       }
       // Prefer the host's dispose-aware setInterval; fall back to the raw
       // Node global when the host exposes none. (Observed live on
