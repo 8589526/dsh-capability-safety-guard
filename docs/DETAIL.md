@@ -1,4 +1,4 @@
-# Capability safety guard
+# DSH Safety Guard
 
 Capability change → automatic health check → auto-fix what is safe, explain the rest. Pre-deploy VRAM checks, trial sandbox for new things.
 

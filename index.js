@@ -1,5 +1,5 @@
 /**
- * capability-safety-guard — 能力安全卫士
+ * capability-safety-guard — DSH安全卫士
  *
  * Host bundle. In every conversation, whenever a capability is added or
  * upgraded (plugin / bundle / tool / skill / MCP server / agent preset /
