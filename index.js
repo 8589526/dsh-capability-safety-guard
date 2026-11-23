@@ -1117,8 +1117,8 @@ const SYSTEM_PS_SCRIPT =
   "$cpu=[math]::Round((Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average);" +
   "$os=Get-CimInstance Win32_OperatingSystem;" +
   "$ram=[PSCustomObject]@{totalMb=[math]::Round($os.TotalVisibleMemorySize/1024);freeMb=[math]::Round($os.FreePhysicalMemory/1024)};" +
-  "$pfTotal=[math]::Max(0,[math]::Round(($os.TotalVirtualMemorySize-$os.TotalVisibleMemorySize)/1024));" +
-  "$pfFree=[math]::Max(0,[math]::Round(($os.FreeVirtualMemory-$os.FreePhysicalMemory)/1024));" +
+  "$pfTotal=[math]::Max(0,[math]::Round($os.TotalVirtualMemorySize/1024));" +
+  "$pfFree=[math]::Max(0,[math]::Round($os.FreeVirtualMemory/1024));" +
   "$pagefile=[PSCustomObject]@{totalMb=$pfTotal;freeMb=$pfFree};" +
   "$disks=@(Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Used -ne $null} | ForEach-Object {[PSCustomObject]@{name=$_.Name;freeGb=[math]::Round($_.Free/1GB,2);totalGb=[math]::Round(($_.Used+$_.Free)/1GB,2)}});" +
   "$procs=@(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 15) | ForEach-Object {[PSCustomObject]@{name=$_.ProcessName;pid=$_.Id;wsMb=[math]::Round($_.WorkingSet64/1MB)}};" +
