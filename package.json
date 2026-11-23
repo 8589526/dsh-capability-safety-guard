@@ -1,6 +1,6 @@
 {
   "name": "dsh-capability-safety-guard",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "type": "module",
   "description": "Auto safety checks after every capability change: 14 multi-sampled checks (GPU, deploy headroom, stuck jobs, plugin health, version channels, core chain, system, ports, power plan, error fingerprints, self-health) plus a safe_trial_run sandbox that rehearses new software before it touches the real machine.",
   "keywords": [
