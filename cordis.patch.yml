@@ -1,0 +1,4 @@
+- insert:
+    - id: capability-safety-guard
+      name: 'dsh-capability-safety-guard'
+      config: {}

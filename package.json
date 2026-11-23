@@ -1,0 +1,51 @@
+{
+  "name": "dsh-capability-safety-guard",
+  "version": "1.0.2",
+  "type": "module",
+  "description": "Auto safety checks after every capability change (GPU, stuck jobs, plugin health, version channels, core chain, system resources, error fingerprints, guardian self-health) plus a safe_trial_run sandbox that rehearses new software before it touches the real machine.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "safety",
+    "gpu",
+    "vram",
+    "sandbox",
+    "trial",
+    "guard"
+  ],
+  "license": "MIT",
+  "author": "Zhang Ziyang",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "icon": "./icon.svg",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/8589526/dsh-capability-safety-guard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/8589526/dsh-capability-safety-guard/issues"
+  },
+  "homepage": "https://github.com/8589526/dsh-capability-safety-guard#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
