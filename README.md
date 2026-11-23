@@ -1,4 +1,6 @@
-# dsh-capability-safety-guard
+# DSH安全卫士 · DSH Safety Guard
+
+> npm: `dsh-capability-safety-guard` · DeepSeek Harness 的能力变更安全体检 + 试跑沙箱插件
 
 Capability safety guard for DeepSeek Harness: after every capability change (plugin/tool/skill/MCP/preset/model) it runs 14 multi-sampled safety checks — GPU, deploy headroom, stuck jobs, plugin health, version channels, core chain, pending restarts, system resources, ports, power plan, error fingerprints, and its own health — auto-fixes what is safely reversible, explains the rest, plus a `safe_trial_run` sandbox that rehearses new software before it touches the real machine.
 

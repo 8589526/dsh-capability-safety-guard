@@ -1,10 +1,19 @@
-<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <path d="M18 5.5 L27.5 9.7 V16.2 C27.5 22.8 23.4 27.7 18 30.5 C12.6 27.7 8.5 22.8 8.5 16.2 V9.7 Z" fill="url(#csg-shield)" />
-  <path d="M13.2 17.6 L16.5 20.9 L22.9 13.9" stroke="#FFFFFF" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round" />
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="csg-shield" x1="8.5" y1="6" x2="27.5" y2="30" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#86B8F5" />
-      <stop offset="1" stop-color="#5269E1" />
+    <linearGradient id="csg-body" x1="32" y1="14" x2="96" y2="110" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7FB2F7"/>
+      <stop offset="0.5" stop-color="#5B72EA"/>
+      <stop offset="1" stop-color="#3B4FD2"/>
+    </linearGradient>
+    <linearGradient id="csg-ecg" x1="34" y1="44" x2="94" y2="80" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D9E5FF"/>
     </linearGradient>
   </defs>
+  <!-- shield body -->
+  <path d="M64 10 L100 25.5 V56 C100 80.5 85.5 98 64 109 C42.5 98 28 80.5 28 56 V25.5 Z" fill="url(#csg-body)"/>
+  <!-- top-left highlight -->
+  <path d="M38 31 C45 24 56 19.5 70 18.5" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="5.5" stroke-linecap="round" fill="none"/>
+  <!-- heartbeat line -->
+  <path d="M34 62 H50 L55.5 55.5 L60 69 L65.5 43.5 L71 71.5 L75.5 58.5 L80 62 H94" stroke="url(#csg-ecg)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
 </svg>
